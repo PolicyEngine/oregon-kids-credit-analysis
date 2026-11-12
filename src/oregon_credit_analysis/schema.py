@@ -35,6 +35,7 @@ class ComparisonResult(BaseModel):
     region: Literal["OR"] = "OR"
     dataset: Literal["populace_us_2024"] = "populace_us_2024"
     limitations: list[str]
+    assumptions: list[str]
     runtime: RuntimeIdentity
     reform: dict[str, dict[str, int | bool]]
     baseline_totals: dict[str, float]

@@ -95,3 +95,9 @@ def test_schema_rejects_nonfinite_and_uncertified_label_omission():
         BudgetImpact(federal=float("nan"), state=0, unattributed=0)
     with pytest.raises(ValidationError):
         RuntimeIdentity(wrapper_version="6.17.2", certification="certified")
+
+
+def test_baseline_subtraction_retains_microseries_weights():
+    baseline = MicroSeries([1000, 2000], weights=[2, 7])
+    reform = MicroSeries([1100, 2020], weights=[2, 7])
+    assert (reform - baseline).sum() == 340

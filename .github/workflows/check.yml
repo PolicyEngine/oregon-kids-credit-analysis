@@ -13,4 +13,5 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv run --python 3.13 --extra test --extra lint ruff check .
       - run: uv run --python 3.13 --extra test --extra lint ruff format --check .
+      - run: python scripts/bootstrap_runtime.py --prepare-only
       - run: uv run --python 3.13 --extra test pytest
