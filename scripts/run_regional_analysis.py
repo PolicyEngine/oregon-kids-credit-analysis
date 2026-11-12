@@ -30,6 +30,7 @@ from oregon_credit_analysis.regional import (  # noqa: E402
 from oregon_credit_analysis.schema import (  # noqa: E402
     DATA_REVISION,
     DATA_SHA256,
+    REGIONAL_CONTEXT_WRAPPER_COMMIT,
     REGIONAL_WRAPPER_COMMIT,
     RuntimeIdentity,
 )
@@ -47,7 +48,9 @@ def digest_series(values):
 
 
 def activate(role):
-    runtime = json.loads((ROOT / f".runtime/runtime-regional-{role}.json").read_text())
+    runtime = json.loads(
+        (ROOT / f".runtime/runtime-regional-ids-{role}.json").read_text()
+    )
     if Path(sys.executable).resolve() != Path(runtime["python"]).resolve():
         raise ValueError("Use the selected, isolated regional interpreter")
     fixture_path = Path(runtime["source"]) / "tests/fixtures/spm_development.py"
@@ -117,7 +120,7 @@ def cache_folder(identity, role, year):
         / ".runtime/yearfiles"
         / role
         / identity.country_source_commit
-        / REGIONAL_WRAPPER_COMMIT
+        / identity.wrapper_source_commit
         / DATA_SHA256
         / str(year)
     )
@@ -159,6 +162,54 @@ def native_input_receipt(country):
             "periods": periods,
         }
     return result
+
+
+def live_identifier_receipt(country, dataset, year):
+    """Verify all live IDs against source rows using the native variable cast."""
+    import pandas as pd
+
+    checked = {}
+    for entity, frame in dataset.data.entity_data.items():
+        frame = pd.DataFrame(frame).set_index(f"{entity}_id", drop=False)
+        frame = frame.loc[country.populations[entity].ids]
+        columns = {f"{entity}_id": f"{entity}_id"}
+        if entity == "person":
+            for group in (
+                "household",
+                "tax_unit",
+                "spm_unit",
+                "family",
+                "marital_unit",
+            ):
+                live = f"person_{group}_id"
+                columns[live] = live if live in frame else f"{group}_id"
+        for live, column in columns.items():
+            variable = country.tax_benefit_system.variables[live]
+            if (
+                str(variable.definition_period) != "year"
+                or live not in country.input_variables
+            ):
+                raise ValueError(
+                    f"Live identifier lacks its native yearly input: {live}"
+                )
+            actual = pd.Series(country.calculate(live, year), copy=False).reset_index(
+                drop=True
+            )
+            expected = pd.Series(frame[column], dtype=variable.dtype).reset_index(
+                drop=True
+            )
+            if not actual.equals(expected):
+                raise ValueError(f"Live identifier differs from source rows: {live}")
+            checked[live] = {
+                "source_column": column,
+                "entity": entity,
+                "period": str(year),
+                "dtype": str(actual.dtype),
+                "sha256": digest_series(actual),
+            }
+    if len(checked) != 11:
+        raise ValueError("All eleven live identifiers must be verified")
+    return {"passed": True, "variables": checked}
 
 
 class NativeObserver:
@@ -247,6 +298,9 @@ class NativeObserver:
                             "household_records": len(
                                 native.populations["household"].ids
                             ),
+                            "live_identifier_check": live_identifier_receipt(
+                                native, frame.f_locals["dataset"], self.year
+                            ),
                             "native_inputs": native_input_receipt(native),
                         }
                         for arm, native in arms.items()
@@ -305,15 +359,74 @@ def prepare(pe, identity, role, year, output):
     original.progress("year_preparation_complete", year=year, role=role)
 
 
-def load_prepared(pe, identity, role, year):
-    folder = cache_folder(identity, role, year)
-    manifest = folder / "preparation.json"
+def load_prepared(pe, identity, role, year, prepared_inputs=None):
+    manifest = (
+        prepared_inputs or cache_folder(identity, role, year) / "preparation.json"
+    )
     receipt = json.loads(manifest.read_text())
-    if (
-        receipt["runtime"] != identity.model_dump()
-        or receipt["source_sha256"] != DATA_SHA256
-    ):
+    prepared_identity = RuntimeIdentity.model_validate(receipt["runtime"])
+    if receipt["source_sha256"] != DATA_SHA256 or (
+        receipt["role"],
+        receipt["year"],
+    ) != (role, year):
         raise ValueError("Prepared inputs use another source or runtime")
+    if prepared_identity != identity:
+        old = prepared_identity.model_dump(
+            exclude={"wrapper_source_commit", "wrapper_wheel_sha256"}
+        )
+        new = identity.model_dump(
+            exclude={"wrapper_source_commit", "wrapper_wheel_sha256"}
+        )
+        if (
+            not prepared_inputs
+            or old != new
+            or prepared_identity.wrapper_source_commit
+            != REGIONAL_CONTEXT_WRAPPER_COMMIT
+        ):
+            raise ValueError("Prepared inputs use another source or runtime")
+        # Explicit reuse of the verified official export. All modules outside
+        # the reviewed input adapter must remain byte-identical.
+        manifests = [
+            ROOT / f".runtime/runtime-{prefix}-{role}.json"
+            for prefix in ("regional", "regional-ids")
+        ]
+        infos = [json.loads(path.read_text()) for path in manifests]
+        wheels = [Path(info["wrapper_wheel"]) for info in infos]
+        if any(
+            original.sha256(path) != expected.wrapper_wheel_sha256
+            for path, expected in zip(
+                wheels, (prepared_identity, identity), strict=True
+            )
+        ):
+            raise ValueError("Preparation producer or consumer wrapper wheel changed")
+        with zipfile.ZipFile(wheels[0]) as left, zipfile.ZipFile(wheels[1]) as right:
+            members = {
+                name
+                for name in left.namelist()
+                if name.startswith("policyengine/") and not name.endswith("/")
+            }
+            right_members = {
+                name
+                for name in right.namelist()
+                if name.startswith("policyengine/") and not name.endswith("/")
+            }
+            if members != right_members or any(
+                left.read(name) != right.read(name)
+                for name in members
+                if name != "policyengine/tax_benefit_models/us/model.py"
+            ):
+                raise ValueError("Official input preparation pipeline changed")
+        receipt = dict(
+            receipt,
+            reuse={
+                "status": "explicit_unchanged_export",
+                "producer_runtime": prepared_identity.model_dump(),
+                "consumer_runtime": identity.model_dump(),
+                "unchanged_package_members": len(members) - 1,
+                "reviewed_adapter_only_change": "PolicyEngine/policyengine.py#754",
+            },
+        )
+    folder = cache_folder(prepared_identity, role, year)
     path = folder / receipt["year_file"]
     if path.parent != folder or original.sha256(path) != receipt["year_file_sha256"]:
         raise ValueError("Official year file differs from its preparation receipt")
@@ -331,14 +444,18 @@ def load_prepared(pe, identity, role, year):
     return dataset, receipt, manifest
 
 
-def snapshot(pe, identity, role, year, region, output, scenario_name):
+def snapshot(
+    pe, identity, role, year, region, output, scenario_name, prepared_inputs=None
+):
     from policyengine.core import Simulation
     from policyengine.core.scoping_strategy import RowFilterStrategy
 
     scenario = original.SCENARIOS[scenario_name] if scenario_name else None
     if scenario and (year != scenario.year or region != "OR"):
         raise ValueError("Policy snapshot must use the scenario's Oregon/year")
-    dataset, prepared, manifest = load_prepared(pe, identity, role, year)
+    dataset, prepared, manifest = load_prepared(
+        pe, identity, role, year, prepared_inputs
+    )
     scope = (
         RowFilterStrategy(variable_name="state_fips", variable_value=41)
         if region == "OR"
@@ -364,7 +481,9 @@ def snapshot(pe, identity, role, year, region, output, scenario_name):
         simulation.run()
     native = observer.country
     if native is None or any(
-        not arm["population_mode"] or arm["household_records"] != expected
+        not arm["population_mode"]
+        or arm["household_records"] != expected
+        or not arm["live_identifier_check"]["passed"]
         for arm in native["arms"].values()
     ):
         raise ValueError("Country run did not retain scoped population semantics")
@@ -423,6 +542,7 @@ def snapshot(pe, identity, role, year, region, output, scenario_name):
                 "preparation_receipt_sha256": original.sha256(manifest),
                 "year_file_sha256": prepared["year_file_sha256"],
                 "output_metadata": output_metadata,
+                "preparation_reuse": prepared.get("reuse"),
             },
             "simulation_configuration": {
                 "initialization": "official_year_inputs_then_modern_simulation",
@@ -512,10 +632,13 @@ def main():
     parser.add_argument("--scenario", choices=tuple(original.SCENARIOS))
     parser.add_argument("--previous", type=Path)
     parser.add_argument("--current", type=Path)
+    parser.add_argument("--prepared-inputs", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():
         parser.error("Refuse to overwrite an existing artifact")
+    if args.prepared_inputs and args.mode != "snapshot":
+        parser.error("Explicit prepared inputs are only valid for a snapshot")
     if args.mode == "parity":
         if not args.previous or not args.current:
             parser.error("Parity needs both actual snapshots")
@@ -526,7 +649,14 @@ def main():
         prepare(pe, identity, args.role, args.year, args.output)
     else:
         snapshot(
-            pe, identity, args.role, args.year, args.region, args.output, args.scenario
+            pe,
+            identity,
+            args.role,
+            args.year,
+            args.region,
+            args.output,
+            args.scenario,
+            args.prepared_inputs,
         )
 
 

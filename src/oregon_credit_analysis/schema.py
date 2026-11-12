@@ -10,13 +10,16 @@ DATA_SHA256 = "6496cc4393d4d3c6574f76eca231de5898c803b9067645591fd5c4d3e65aee84"
 DATA_REVISION = "populace-us-2024-spm-20260915"
 WRAPPER_VERSION = "6.17.2"
 WRAPPER_COMMIT = "5b6d7901cf93ffbc903874aa305689c03fcb9247"
-REGIONAL_WRAPPER_COMMIT = "e5e18f80070c50c353f2d65130f0f10e180df770"
+REGIONAL_CONTEXT_WRAPPER_COMMIT = "e5e18f80070c50c353f2d65130f0f10e180df770"
+REGIONAL_WRAPPER_COMMIT = "7147b459e320753acf8ac2674215b780da3dbd6d"
 
 
 class RuntimeIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
     wrapper_version: Literal["6.17.2"]
-    wrapper_source_commit: Literal[WRAPPER_COMMIT, REGIONAL_WRAPPER_COMMIT]
+    wrapper_source_commit: Literal[
+        WRAPPER_COMMIT, REGIONAL_CONTEXT_WRAPPER_COMMIT, REGIONAL_WRAPPER_COMMIT
+    ]
     wrapper_wheel_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     wrapper_build_status: Literal["official_release", "unreleased_source_build"] = (
         "official_release"
@@ -34,7 +37,7 @@ class RuntimeIdentity(BaseModel):
 
     @model_validator(mode="after")
     def wrapper_provenance(self):
-        patched = self.wrapper_source_commit == REGIONAL_WRAPPER_COMMIT
+        patched = self.wrapper_source_commit != WRAPPER_COMMIT
         if patched != (self.wrapper_build_status == "unreleased_source_build"):
             raise ValueError(
                 "Patched wrapper must be labeled an unreleased source build"

@@ -20,7 +20,7 @@ SPM_VERSION = "1.1.0"
 SPM_WHEEL_SHA = "c528ec0f06eeb1188b7d6cf456ff3a9b73a0fd8856b3938358251cc5f9be83e8"
 SPM_FORECAST_SHA = "335e6755dc8e0bd883e09b76c2bd53a5315683773e44d50085c7d6b8832b6291"
 CORE_VERSION = "3.34.2"
-REGIONAL_WRAPPER_COMMIT = "e5e18f80070c50c353f2d65130f0f10e180df770"
+REGIONAL_WRAPPER_COMMIT = "7147b459e320753acf8ac2674215b780da3dbd6d"
 
 
 def sha256(path: Path) -> str:
@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--wrapper-wheel", type=Path)
     parser.add_argument("--wrapper-source", type=Path)
     parser.add_argument("--wrapper-commit")
-    parser.add_argument("--runtime-prefix", choices=("regional",))
+    parser.add_argument("--runtime-prefix", choices=("regional-ids",))
     args = parser.parse_args()
     wrapper_wheel, wrapper_info = artifact(
         "policyengine", WRAPPER_VERSION, ".whl", WRAPPER_WHEEL_SHA
@@ -156,10 +156,14 @@ def main():
     spm_wheel, spm_info = artifact("spm-calculator", SPM_VERSION, ".whl", SPM_WHEEL_SHA)
     override = (args.wrapper_wheel, args.wrapper_source, args.wrapper_commit)
     if any(override) or args.runtime_prefix:
-        if not all(override) or args.runtime_prefix != "regional" or args.prepare_only:
+        if (
+            not all(override)
+            or args.runtime_prefix != "regional-ids"
+            or args.prepare_only
+        ):
             parser.error(
                 "Source wrapper builds require all wrapper arguments "
-                "and --runtime-prefix regional"
+                "and --runtime-prefix regional-ids"
             )
         wrapper_wheel = args.wrapper_wheel.resolve(strict=True)
         wrapper_files = verify_wrapper_source(
