@@ -53,8 +53,8 @@ COVARIATES = (
     ("employment_income", "person"),
 )
 ASSUMPTIONS = [
-    "Every filer who satisfies Oregon credit eligibility claims the calculated credit; "
-    "or_ctc has no separate take-up adjustment.",
+    "The Oregon credit is calculated for every eligible modeled tax unit; "
+    "or_ctc has no separate filing or take-up adjustment.",
     "The source data carry other programs’ participation inputs unchanged.",
 ]
 LIMITATIONS = [
