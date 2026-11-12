@@ -438,6 +438,116 @@ def split_preflight(identity, output):
     )
 
 
+def input_fingerprints(simulation, year):
+    """Fingerprint native input values only; never construct analysis weights."""
+    return {
+        name: hashlib.sha256(
+            simulation.calc(name, period=year)
+            .to_json(orient="split", double_precision=15)
+            .encode()
+        ).hexdigest()
+        for name in sorted(simulation.input_variables)
+    }
+
+
+def memory_preflight(identity, output):
+    from policyengine.tax_benefit_models.us.household import _build_situation
+    from policyengine_core.reforms import Reform
+    from policyengine_us import CountryTaxBenefitSystem, Microsimulation
+
+    # Identical to the input-only subclass used by the upstream US model.run:
+    # an explicit synthetic household must not load the default population.
+    class InputMicrosimulation(Microsimulation):
+        default_dataset = None
+
+    checked = {}
+    for name, scenario in SCENARIOS.items():
+        groups = {
+            entity: [{"members": [0, 1]}]
+            for entity in (
+                "marital_unit",
+                "family",
+                "spm_unit",
+                "tax_unit",
+                "household",
+            )
+        }
+        groups["household"][0].update(
+            state_code="OR", county_fips="41051", household_weight=1.0
+        )
+        groups["tax_unit"][0].update(filing_status="HEAD_OF_HOUSEHOLD")
+        situation = _build_situation(
+            people=[{"age": 40, "employment_income": 20_000}, {"age": 3}],
+            groups=groups,
+            year=scenario.year,
+        )
+        old = InputMicrosimulation(
+            situation=situation,
+            tax_benefit_system=CountryTaxBenefitSystem(
+                reform=(Reform.from_dict(scenario.reform(), country_id="us"),)
+            ),
+        )
+        new = InputMicrosimulation(situation=situation)
+        before = input_fingerprints(new, scenario.year)
+        original_parameters = parameter_values(new.tax_benefit_system)
+        apply_scenario(new, scenario)
+        after = input_fingerprints(new, scenario.year)
+        if before != after or after != input_fingerprints(old, scenario.year):
+            raise ValueError(f"Supported reform changed synthetic inputs for {name}")
+        parameters = parameter_values(new.tax_benefit_system)
+        if parameters != parameter_values(old.tax_benefit_system):
+            raise ValueError(f"Supported reform changed policy dates for {name}")
+        for year in range(2026, scenario.start_year):
+            if parameters[str(year)] != original_parameters[str(year)]:
+                raise ValueError(f"Future policy changed an earlier year for {name}")
+        if old.baseline is not None or new.baseline is not None:
+            raise ValueError("A single-population preflight retained a baseline")
+        old_totals, _, old_vectors = totals(old, scenario.year, "OR")
+        new_totals, _, new_vectors = totals(new, scenario.year, "OR")
+        if old_totals != new_totals:
+            raise ValueError(f"Supported reform changed actual totals for {name}")
+        for variable in VARIABLES:
+            if not old_vectors[variable].equals(new_vectors[variable]) or not (
+                old_vectors[variable].weights.equals(new_vectors[variable].weights)
+            ):
+                raise ValueError(
+                    f"Supported reform changed native {variable} for {name}"
+                )
+        if (
+            old.spm_config != new.spm_config
+            or old.spm_provenance() != new.spm_provenance()
+        ):
+            raise ValueError(f"Supported reform changed SPM receipts for {name}")
+        record = {
+            "parameters": parameters,
+            "native_input_fingerprints": after,
+            "spm_configuration": new.spm_config,
+            "spm_provenance": new.spm_provenance(),
+            "synthetic_totals": new_totals,
+        }
+        del old, new
+        gc.collect()
+        check, _ = native_accounting_check(new_vectors)
+        if not check["passed"] or any(
+            float(new_vectors[variable].sum()) != new_totals[variable]
+            for variable in VARIABLES
+        ):
+            raise ValueError(f"Simulation release changed native values for {name}")
+        record["post_release_accounting_check"] = check
+        checked[name] = record
+        del old_vectors, new_vectors
+        gc.collect()
+    write_json(
+        output,
+        {
+            "status": "passed",
+            "runtime": identity.model_dump(),
+            "scenarios": checked,
+            "analysis_runner_sha256": sha256(__file__),
+        },
+    )
+
+
 def load_snapshot(path):
     payload = json.loads(Path(path).read_text())
     required = {"accounting_components_file", "accounting_components_sha256"}
@@ -625,7 +735,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "mode",
-        choices=("preflight", "split-preflight", "scenario", "snapshot", "compare"),
+        choices=(
+            "preflight",
+            "split-preflight",
+            "memory-preflight",
+            "scenario",
+            "snapshot",
+            "compare",
+        ),
     )
     parser.add_argument(
         "--role", choices=("baseline", "candidate"), default="candidate"
@@ -657,6 +774,8 @@ def main():
         preflight(pe, identity, args.output)
     elif args.mode == "split-preflight":
         split_preflight(identity, args.output)
+    elif args.mode == "memory-preflight":
+        memory_preflight(identity, args.output)
     else:
         snapshot(pe, identity, args.year, args.region, args.output, args.scenario)
 
