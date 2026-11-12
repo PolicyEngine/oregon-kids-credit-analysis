@@ -30,6 +30,7 @@ from oregon_credit_analysis.regional import (  # noqa: E402
 from oregon_credit_analysis.schema import (  # noqa: E402
     DATA_REVISION,
     DATA_SHA256,
+    MANAGED_SCOPE_WRAPPER_COMMIT,
     REGIONAL_CONTEXT_WRAPPER_COMMIT,
     REGIONAL_WRAPPER_COMMIT,
     RuntimeIdentity,
@@ -47,10 +48,12 @@ def digest_series(values):
     ).hexdigest()
 
 
-def activate(role):
-    runtime = json.loads(
-        (ROOT / f".runtime/runtime-regional-ids-{role}.json").read_text()
-    )
+def activate(role, profile="regional-ids"):
+    expected_commit = {
+        "regional-ids": REGIONAL_WRAPPER_COMMIT,
+        "managed-scope": MANAGED_SCOPE_WRAPPER_COMMIT,
+    }[profile]
+    runtime = json.loads((ROOT / f".runtime/runtime-{profile}-{role}.json").read_text())
     if Path(sys.executable).resolve() != Path(runtime["python"]).resolve():
         raise ValueError("Use the selected, isolated regional interpreter")
     fixture_path = Path(runtime["source"]) / "tests/fixtures/spm_development.py"
@@ -73,7 +76,7 @@ def activate(role):
     ):
         raise ValueError("Unexpected model/data qualification")
     wrapper = runtime["wrapper"]
-    if wrapper["source_commit"] != REGIONAL_WRAPPER_COMMIT:
+    if wrapper["source_commit"] != expected_commit:
         raise ValueError("Unexpected wrapper adapter source")
     wheel = Path(runtime["wrapper_wheel"])
     if original.sha256(wheel) != wrapper["sha256"]:

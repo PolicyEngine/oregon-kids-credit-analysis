@@ -12,13 +12,17 @@ WRAPPER_VERSION = "6.17.2"
 WRAPPER_COMMIT = "5b6d7901cf93ffbc903874aa305689c03fcb9247"
 REGIONAL_CONTEXT_WRAPPER_COMMIT = "e5e18f80070c50c353f2d65130f0f10e180df770"
 REGIONAL_WRAPPER_COMMIT = "7147b459e320753acf8ac2674215b780da3dbd6d"
+MANAGED_SCOPE_WRAPPER_COMMIT = "628cbaf63e31dce8477be4b0215c07bcc3b49d47"
 
 
 class RuntimeIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    wrapper_version: Literal["6.17.2"]
+    wrapper_version: Literal["6.17.2", "6.18.0"]
     wrapper_source_commit: Literal[
-        WRAPPER_COMMIT, REGIONAL_CONTEXT_WRAPPER_COMMIT, REGIONAL_WRAPPER_COMMIT
+        WRAPPER_COMMIT,
+        REGIONAL_CONTEXT_WRAPPER_COMMIT,
+        REGIONAL_WRAPPER_COMMIT,
+        MANAGED_SCOPE_WRAPPER_COMMIT,
     ]
     wrapper_wheel_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     wrapper_build_status: Literal["official_release", "unreleased_source_build"] = (
@@ -37,6 +41,13 @@ class RuntimeIdentity(BaseModel):
 
     @model_validator(mode="after")
     def wrapper_provenance(self):
+        expected_version = (
+            "6.18.0"
+            if self.wrapper_source_commit == MANAGED_SCOPE_WRAPPER_COMMIT
+            else "6.17.2"
+        )
+        if self.wrapper_version != expected_version:
+            raise ValueError("Wrapper version differs from its pinned source commit")
         patched = self.wrapper_source_commit != WRAPPER_COMMIT
         if patched != (self.wrapper_build_status == "unreleased_source_build"):
             raise ValueError(

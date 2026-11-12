@@ -21,6 +21,14 @@ SPM_WHEEL_SHA = "c528ec0f06eeb1188b7d6cf456ff3a9b73a0fd8856b3938358251cc5f9be83e
 SPM_FORECAST_SHA = "335e6755dc8e0bd883e09b76c2bd53a5315683773e44d50085c7d6b8832b6291"
 CORE_VERSION = "3.34.2"
 REGIONAL_WRAPPER_COMMIT = "7147b459e320753acf8ac2674215b780da3dbd6d"
+MANAGED_SCOPE_WRAPPER_COMMIT = "628cbaf63e31dce8477be4b0215c07bcc3b49d47"
+MANAGED_SCOPE_WRAPPER_VERSION = "6.18.0"
+MANAGED_SCOPE_WHEEL_SHA = (
+    "8cc4287740ea38ac7fb1527bea52d1f1bb9128aafdfe0d6b821897ab95a37c3f"
+)
+MANAGED_SCOPE_SDIST_SHA = (
+    "728e1907378536ebf229c28d18ac24db04d74349ddf8dbec4bb79349cbd74388"
+)
 
 
 def sha256(path: Path) -> str:
@@ -81,7 +89,7 @@ def verify_model_source(wheel: Path, source: Path, commit: str):
 
 def verify_wrapper_source(wheel: Path, source: Path, commit: str):
     """Authenticate the explicitly selected, publicly reviewed adapter build."""
-    if commit != REGIONAL_WRAPPER_COMMIT:
+    if commit not in (REGIONAL_WRAPPER_COMMIT, MANAGED_SCOPE_WRAPPER_COMMIT):
         raise ValueError("Unrecognized regional wrapper source commit")
     actual = subprocess.check_output(
         ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
@@ -144,13 +152,23 @@ def main():
     parser.add_argument("--wrapper-wheel", type=Path)
     parser.add_argument("--wrapper-source", type=Path)
     parser.add_argument("--wrapper-commit")
-    parser.add_argument("--runtime-prefix", choices=("regional-ids",))
+    parser.add_argument("--runtime-prefix", choices=("regional-ids", "managed-scope"))
     args = parser.parse_args()
+    scope_profile = args.runtime_prefix == "managed-scope"
+    reference_version = (
+        MANAGED_SCOPE_WRAPPER_VERSION if scope_profile else WRAPPER_VERSION
+    )
     wrapper_wheel, wrapper_info = artifact(
-        "policyengine", WRAPPER_VERSION, ".whl", WRAPPER_WHEEL_SHA
+        "policyengine",
+        reference_version,
+        ".whl",
+        MANAGED_SCOPE_WHEEL_SHA if scope_profile else WRAPPER_WHEEL_SHA,
     )
     source_archive, source_info = artifact(
-        "policyengine", WRAPPER_VERSION, ".tar.gz", WRAPPER_SDIST_SHA
+        "policyengine",
+        reference_version,
+        ".tar.gz",
+        MANAGED_SCOPE_SDIST_SHA if scope_profile else WRAPPER_SDIST_SHA,
     )
     core_wheel, core_info = artifact("policyengine-core", CORE_VERSION, ".whl")
     spm_wheel, spm_info = artifact("spm-calculator", SPM_VERSION, ".whl", SPM_WHEEL_SHA)
@@ -158,26 +176,31 @@ def main():
     if any(override) or args.runtime_prefix:
         if (
             not all(override)
-            or args.runtime_prefix != "regional-ids"
+            or args.runtime_prefix not in ("regional-ids", "managed-scope")
             or args.prepare_only
         ):
             parser.error(
                 "Source wrapper builds require all wrapper arguments "
-                "and --runtime-prefix regional-ids"
+                "and an explicit --runtime-prefix"
             )
+        expected_commit = (
+            MANAGED_SCOPE_WRAPPER_COMMIT if scope_profile else REGIONAL_WRAPPER_COMMIT
+        )
+        if args.wrapper_commit != expected_commit:
+            parser.error("Wrapper source commit differs from its runtime profile")
         wrapper_wheel = args.wrapper_wheel.resolve(strict=True)
         wrapper_files = verify_wrapper_source(
             wrapper_wheel, args.wrapper_source.resolve(), args.wrapper_commit
         )
         wrapper_info = {
-            "version": WRAPPER_VERSION,
+            "version": reference_version,
             "source_commit": args.wrapper_commit,
             "source_repository": "https://github.com/PolicyEngine/policyengine.py",
             "sha256": sha256(wrapper_wheel),
             "build_status": "unreleased_source_build",
             "package_files_verified": wrapper_files,
         }
-    source = RUNTIME / f"policyengine-{WRAPPER_VERSION}"
+    source = RUNTIME / f"policyengine-{reference_version}"
     if not source.exists():
         with tarfile.open(fileobj=io.BytesIO(source_archive.read_bytes())) as archive:
             archive.extractall(RUNTIME, filter="data")
@@ -188,7 +211,9 @@ def main():
             "scripts/spm_bundle.py",
             "scripts/bundle.py",
         ):
-            packaged = archive.extractfile(f"policyengine-{WRAPPER_VERSION}/{relative}")
+            packaged = archive.extractfile(
+                f"policyengine-{reference_version}/{relative}"
+            )
             if packaged is None or (source / relative).read_bytes() != packaged.read():
                 raise ValueError(f"Upstream development helper changed: {relative}")
     RUNTIME.mkdir(exist_ok=True)
