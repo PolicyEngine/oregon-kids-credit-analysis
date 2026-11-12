@@ -20,6 +20,7 @@ Each comparison uses current law under the same country-model wheel. Oregon's cr
 The analysis uses `uv` and Python 3.13. Tests exercise policy dates, weighted filtering, accounting identities and result labels:
 
 ```bash
+python scripts/bootstrap_runtime.py --prepare-only
 uv run --locked --extra test pytest
 ```
 
