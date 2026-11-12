@@ -4,6 +4,7 @@ import pickle
 import runpy
 from pathlib import Path
 
+import numpy as np
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -12,9 +13,12 @@ from pydantic import ValidationError
 
 from oregon_credit_analysis.accounting import (
     BUDGET_VARIABLES,
+    IDENTITY_INPUTS,
     BudgetImpact,
     accounting_residual,
     budget_impact,
+    native_absolute,
+    native_accounting_check,
 )
 from oregon_credit_analysis.scenarios import CTC, SCENARIOS
 from oregon_credit_analysis.schema import RuntimeIdentity
@@ -133,3 +137,33 @@ def test_native_snapshot_roundtrip_preserves_weighted_difference_and_index():
     assert loaded[0].weights.equals(baseline.weights)
     assert (loaded[1] - loaded[0]).sum() == 340
     assert ((loaded[1] - loaded[0]) > 0).sum() == 9
+
+
+def test_native_absolute_retains_unequal_weights():
+    values = MicroSeries([-2, 3], weights=[7, 11])
+    assert values.abs().sum() == 5  # pandas abs loses MicroSeries metadata.
+    assert native_absolute(values).sum() == 47
+
+
+def test_exact_record_check_distinguishes_model_rounding_from_bad_record():
+    names = (*IDENTITY_INPUTS, "household_net_income")
+    vectors = {
+        name: MicroSeries(np.array([0, 0], dtype=np.float32), weights=[7, 11])
+        for name in names
+    }
+    vectors["household_market_income"] = MicroSeries(
+        np.array([-1e8, 1e8], dtype=np.float32), weights=[7, 11]
+    )
+    vectors["household_refundable_tax_credits"] = MicroSeries(
+        np.array([1, 0], dtype=np.float32), weights=[7, 11]
+    )
+    vectors["household_net_income"] = vectors["household_market_income"].copy()
+    check, masses = native_accounting_check(vectors)
+    assert check["passed"]  # float32 legitimately rounds away the first $1.
+    assert check["residual"] == -7
+    assert masses["household_market_income"] == 1.8e9
+    vectors["household_net_income"].iloc[0] += np.float32(16)
+    broken, _ = native_accounting_check(vectors)
+    assert not broken["passed"]
+    assert broken["violating_records"] == 1
+    assert broken["weighted_violating_households"] == 7

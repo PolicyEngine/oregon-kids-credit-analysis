@@ -21,8 +21,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from oregon_credit_analysis.accounting import (  # noqa: E402
     BUDGET_VARIABLES,
+    IDENTITY_INPUTS,
     accounting_residual,
     budget_impact,
+    native_accounting_check,
 )
 from oregon_credit_analysis.scenarios import CTC, SCENARIOS  # noqa: E402
 from oregon_credit_analysis.schema import (  # noqa: E402
@@ -182,15 +184,22 @@ def totals(simulation, year, region):
     geography = simulation.calc("state_fips", period=year, map_to="household")
     mask = geography == 41 if region == "OR" else geography == geography
     output = {}
+    accounting_vectors = {}
     for variable in VARIABLES:
         progress("calculate_start", variable=variable, year=year)
         values = simulation.calc(variable, period=year, map_to="household")
         if values.isna().any():
             raise ValueError(f"Missing {variable} values before geographic aggregation")
         output[variable] = float(values[mask].sum())
+        if variable in (*IDENTITY_INPUTS, "household_net_income"):
+            if str(values.dtype) != "float32" or str(values.weights.dtype) != "float64":
+                raise ValueError("Accounting precision assumptions differ from runtime")
+            if values.weights.isna().any() or (values.weights < 0).any():
+                raise ValueError("Accounting bound requires finite nonnegative weights")
+            accounting_vectors[variable] = values[mask]
         progress("calculate_complete", variable=variable, year=year)
     output["households"] = float((geography[mask] == geography[mask]).sum())
-    return output, mask
+    return output, mask, accounting_vectors
 
 
 def input_audit(simulation):
@@ -317,8 +326,8 @@ def snapshot(pe, identity, year, region, output, scenario_name=None):
     progress("construct_complete", scenario=scenario_name, year=year, region=region)
     source_inputs = input_audit(simulation)
     fingerprints = covariate_fingerprints(simulation, year)
-    values, mask = totals(simulation, year, region)
-    residual = accounting_residual(values)
+    values, mask, accounting_vectors = totals(simulation, year, region)
+    check, absolute_masses = native_accounting_check(accounting_vectors)
     vector = simulation.calc("household_net_income", period=year, map_to="household")[
         mask
     ]
@@ -327,6 +336,10 @@ def snapshot(pe, identity, year, region, output, scenario_name=None):
     # Native MicroSeries serialization preserves its weights and row index.
     # This ignored local file contains microdata and must never be published.
     vector_path.write_bytes(pickle.dumps(vector, protocol=pickle.HIGHEST_PROTOCOL))
+    components_path = Path(output).with_suffix(".components.pkl")
+    components_path.write_bytes(
+        pickle.dumps(accounting_vectors, protocol=pickle.HIGHEST_PROTOCOL)
+    )
     write_json(
         output,
         {
@@ -342,6 +355,8 @@ def snapshot(pe, identity, year, region, output, scenario_name=None):
             "source_input_audit": source_inputs,
             "household_vector_file": vector_path.name,
             "household_vector_sha256": sha256(vector_path),
+            "accounting_components_file": components_path.name,
+            "accounting_components_sha256": sha256(components_path),
             "health_in_household_benefits": bool(
                 simulation.tax_benefit_system.parameters(
                     f"{year}-01-01"
@@ -349,16 +364,17 @@ def snapshot(pe, identity, year, region, output, scenario_name=None):
             ),
             "parameters": parameter_values(simulation.tax_benefit_system),
             "bundle": simulation.policyengine_bundle,
-            "accounting_residual": residual,
-            "accounting_status": "passed" if abs(residual) <= 5 else "failed",
+            "accounting_residual": check["residual"],
+            "accounting_check": check,
+            "accounting_absolute_masses": absolute_masses,
+            "accounting_status": "passed" if check["passed"] else "failed",
             "analysis_runner_sha256": sha256(__file__),
             "completed_at": datetime.now(UTC).isoformat(),
         },
     )
-    if abs(residual) > 5:
+    if not check["passed"]:
         raise ValueError(
-            f"Household accounting fails by {residual}; "
-            "actual checkpoint saved for audit"
+            f"Household accounting fails: {check}; actual checkpoint saved for audit"
         )
     progress("snapshot_complete", scenario=scenario_name, year=year, region=region)
 
@@ -407,7 +423,21 @@ def split_preflight(identity, output):
 
 
 def load_snapshot(path):
-    return json.loads(Path(path).read_text())
+    payload = json.loads(Path(path).read_text())
+    if "accounting_components_file" in payload:
+        components = Path(path).parent / payload["accounting_components_file"]
+        if components.parent.resolve() != Path(path).parent.resolve():
+            raise ValueError("Accounting vectors must be beside their snapshot")
+        if sha256(components) != payload["accounting_components_sha256"]:
+            raise ValueError("Accounting component fingerprint mismatch")
+        vectors = pickle.loads(components.read_bytes())
+        check, masses = native_accounting_check(vectors)
+        if (
+            check != payload["accounting_check"]
+            or masses != payload["accounting_absolute_masses"]
+        ):
+            raise ValueError("Per-household accounting receipt does not reproduce")
+    return payload
 
 
 def validate_snapshot_pair(base, ref):
@@ -464,8 +494,6 @@ def comparison(left, right, name, output):
         "baseline": accounting_residual(base),
         "reform": accounting_residual(ref),
     }
-    if any(abs(value) > 5 for value in residuals.values()):
-        raise ValueError(f"Household accounting fails: {residuals}")
     gain = ref_vector - base_vector
     health = base_snapshot["health_in_household_benefits"]
     result = ComparisonResult(
@@ -494,6 +522,10 @@ def comparison(left, right, name, output):
             "baseline_parameters": base_snapshot["parameters"],
             "reform_parameters": ref_snapshot["parameters"],
             "snapshot_sha256": {"baseline": sha256(left), "reform": sha256(right)},
+            "accounting_checks": {
+                "baseline": base_snapshot["accounting_check"],
+                "reform": ref_snapshot["accounting_check"],
+            },
         },
     )
 

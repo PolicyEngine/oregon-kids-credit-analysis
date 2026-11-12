@@ -16,6 +16,13 @@ BUDGET_VARIABLES = (
     "employee_payroll_tax",
     "state_income_tax",
 )
+IDENTITY_INPUTS = (
+    "household_market_income",
+    "household_benefits",
+    "household_refundable_tax_credits",
+    "household_tax_before_refundable_credits",
+    "household_health_costs",
+)
 
 
 class BudgetImpact(BaseModel):
@@ -66,3 +73,70 @@ def accounting_residual(totals: dict[str, float]) -> float:
         - totals["household_tax_before_refundable_credits"]
         - totals["household_health_costs"]
     )
+
+
+def native_absolute(values):
+    """Preserve MicroSeries weights; pandas abs currently drops that metadata."""
+    from microdf import MicroSeries
+
+    if not isinstance(values, MicroSeries):
+        raise TypeError("Accounting vectors must retain their native MicroSeries type")
+    result = values * (2 * (values >= 0) - 1)
+    if not isinstance(result, MicroSeries):
+        raise TypeError("Absolute values lost their native MicroSeries type")
+    return result
+
+
+def native_accounting_check(vectors):
+    """Require each native float32 record to match Core's exact operation order."""
+    from microdf import MicroSeries
+
+    names = (*IDENTITY_INPUTS, "household_net_income")
+    reference = vectors["household_net_income"]
+    for name in names:
+        value = vectors[name]
+        if not isinstance(value, MicroSeries) or str(value.dtype) != "float32":
+            raise ValueError("Accounting requires native float32 outcome vectors")
+        if not value.index.equals(reference.index) or not value.weights.equals(
+            reference.weights
+        ):
+            raise ValueError("Accounting vector indexes or weights differ")
+        if value.isna().any() or value.isin([float("inf"), -float("inf")]).any():
+            raise ValueError("Accounting values must be finite")
+        weights = value.weights
+        if (
+            str(weights.dtype) != "float64"
+            or weights.isna().any()
+            or ((weights < 0) | weights.isin([float("inf"), -float("inf")])).any()
+        ):
+            raise ValueError("Accounting requires finite nonnegative float64 weights")
+    # Core's _run_formula starts at zero, then adds these three arrays and
+    # subtracts these two. Zero + the first array is exact. Keep all four
+    # remaining operations in float32, exactly as the actual model does.
+    rebuilt = (
+        vectors["household_market_income"]
+        + vectors["household_benefits"]
+        + vectors["household_refundable_tax_credits"]
+        - vectors["household_tax_before_refundable_credits"]
+        - vectors["household_health_costs"]
+    )
+    if str(rebuilt.dtype) != "float32":
+        raise ValueError("Reconstructed identity changed Core's arithmetic precision")
+    violations = rebuilt != reference
+    masses = {
+        name: float(native_absolute(vectors[name].astype("float64")).sum())
+        for name in names
+    }
+    totals = {name: float(vectors[name].sum()) for name in names}
+    check = {
+        "method": "exact_core_float32_identity_per_household",
+        "operation_order": (
+            "market + benefits + refundable_credits - tax_before - health"
+        ),
+        "residual": accounting_residual(totals),
+        "records": len(reference),
+        "violating_records": len(violations[violations]),
+        "weighted_violating_households": float(violations.sum()),
+        "passed": bool(rebuilt.equals(reference)),
+    }
+    return check, masses

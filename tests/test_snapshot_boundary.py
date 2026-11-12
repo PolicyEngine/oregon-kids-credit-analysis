@@ -6,10 +6,15 @@ import pickle
 import runpy
 from pathlib import Path
 
+import numpy as np
 import pytest
 from microdf import MicroSeries
 
-from oregon_credit_analysis.accounting import BUDGET_VARIABLES
+from oregon_credit_analysis.accounting import (
+    BUDGET_VARIABLES,
+    IDENTITY_INPUTS,
+    native_accounting_check,
+)
 from oregon_credit_analysis.scenarios import SCENARIOS
 from oregon_credit_analysis.schema import DATA_REVISION, DATA_SHA256, WRAPPER_COMMIT
 
@@ -24,25 +29,39 @@ def runner():
 def save_synthetic_snapshot(directory, role, *, weights=(2, 7)):
     reform = role == "reform"
     vector = MicroSeries(
-        [1100.0, 2020.0] if reform else [1000.0, 2000.0],
+        np.array([1002.0, 2048.0] if reform else [1000.0, 2000.0], dtype=np.float32),
         weights=weights,
         index=[17, 91],
     )
     data = pickle.dumps(vector)
     vector_path = directory / f"{role}.households.pkl"
     vector_path.write_bytes(data)
+    vectors = {
+        name: MicroSeries(
+            np.array([0, 0], dtype=np.float32), weights=weights, index=vector.index
+        )
+        for name in (*IDENTITY_INPUTS, "household_net_income")
+    }
+    vectors["household_net_income"] = vector
+    vectors["household_market_income"] = MicroSeries(
+        np.array([1005, 2070], dtype=np.float32), weights=weights, index=vector.index
+    )
+    vectors["household_tax_before_refundable_credits"] = MicroSeries(
+        np.array([3, 22] if reform else [5, 70], dtype=np.float32),
+        weights=weights,
+        index=vector.index,
+    )
     totals = dict.fromkeys(BUDGET_VARIABLES, 0.0)
+    totals.update({name: float(values.sum()) for name, values in vectors.items()})
     totals.update(
-        household_tax=160.0 if reform else 500.0,
-        state_income_tax=160.0 if reform else 500.0,
-        household_net_income=float(vector.sum()),
-        household_market_income=16_500.0,
-        household_refundable_tax_credits=0.0,
-        household_tax_before_refundable_credits=160.0 if reform else 500.0,
-        household_health_costs=0.0,
+        household_tax=totals["household_tax_before_refundable_credits"],
+        state_income_tax=totals["household_tax_before_refundable_credits"],
         or_ctc=340.0 if reform else 0.0,
         households=9.0,
     )
+    components_data = pickle.dumps(vectors)
+    components_path = directory / f"{role}.components.pkl"
+    components_path.write_bytes(components_data)
     payload = {
         "year": 2027,
         "region": "OR",
@@ -72,6 +91,13 @@ def save_synthetic_snapshot(directory, role, *, weights=(2, 7)):
         "parameters": {},
         "bundle": {},
     }
+    check, masses = native_accounting_check(vectors)
+    payload["accounting_absolute_masses"] = masses
+    payload["accounting_check"] = check
+    payload["accounting_components_file"] = components_path.name
+    payload["accounting_components_sha256"] = hashlib.sha256(
+        components_data
+    ).hexdigest()
     path = directory / f"{role}.json"
     path.write_text(json.dumps(payload))
     return path
