@@ -51,4 +51,6 @@ Use `snapshot --year 2026 --region us` under each role for the national CPI comp
 
 All aggregates use `MicroSeries` operations and `map_to`. Budget accounting includes taxes, cash and in-kind benefits, and shared government health costs, following [PolicyEngine's budgetary-impact definition](https://github.com/PolicyEngine/policyengine.py/blob/5b6d7901cf93ffbc903874aa305689c03fcb9247/src/policyengine/tax_benefit_models/us/analysis.py). Direct credit outlays remain a separate measure.
 
+A household gains when its annual net income increases by more than $0.01 and loses when it decreases by more than $0.01. Each snapshot verifies the net-income identity for every household in the model's exact float32 operation order. Saved native vectors reproduce every reported aggregate, index and weight.
+
 Population runs use the host's heavy-run wrapper and execute one comparison per process. Local runtime files, microdata and draft results stay outside version control. This repository currently publishes code; numerical results require completed model runs and review.

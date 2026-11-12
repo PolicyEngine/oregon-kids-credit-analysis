@@ -64,6 +64,7 @@ LIMITATIONS = [
     "This run does not reproduce an ACS-local website report.",
     "No behavioral response parameters were changed by the analysis.",
 ]
+GAIN_THRESHOLD = 0.01
 
 
 def sha256(path):
@@ -548,8 +549,8 @@ def comparison(left, right, name, output):
         reform_totals=ref,
         changes=changes,
         budget=budget_impact(changes, health_in_household_benefits=health),
-        households_gaining=float((gain > 0.01).sum()),
-        households_losing=float((gain < -0.01).sum()),
+        households_gaining=float((gain > GAIN_THRESHOLD).sum()),
+        households_losing=float((gain < -GAIN_THRESHOLD).sum()),
         oregon_household_records=len(gain),
         covariates_preserved=True,
         accounting_residuals=residuals,
@@ -563,6 +564,10 @@ def comparison(left, right, name, output):
             "baseline_parameters": base_snapshot["parameters"],
             "reform_parameters": ref_snapshot["parameters"],
             "snapshot_sha256": {"baseline": sha256(left), "reform": sha256(right)},
+            "household_classification": {
+                "gaining": "annual net-income change > $0.01",
+                "losing": "annual net-income change < -$0.01",
+            },
             "accounting_checks": {
                 "baseline": base_snapshot["accounting_check"],
                 "reform": ref_snapshot["accounting_check"],
