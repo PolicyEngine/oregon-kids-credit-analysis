@@ -435,6 +435,10 @@ def load_household_vector(snapshot_path, snapshot):
     values = pickle.loads(path.read_bytes())
     if not isinstance(values, MicroSeries):
         raise ValueError("Household values lost their native MicroSeries type")
+    if len(values) != snapshot["household_records"]:
+        raise ValueError("Native vector row count differs from its actual snapshot")
+    if abs(float(values.sum()) - snapshot["totals"]["household_net_income"]) > 0.005:
+        raise ValueError("Native vector aggregate differs from its actual snapshot")
     return values
 
 
