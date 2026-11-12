@@ -473,11 +473,19 @@ def memory_preflight(identity, output):
             )
         }
         groups["household"][0].update(
-            state_code="OR", county_fips="41051", household_weight=1.0
+            state_code="OR", state_fips=41, county_fips="41051", household_weight=1.0
         )
         groups["tax_unit"][0].update(filing_status="HEAD_OF_HOUSEHOLD")
         situation = _build_situation(
-            people=[{"age": 40, "employment_income": 20_000}, {"age": 3}],
+            people=[
+                {
+                    "age": 40,
+                    "employment_income": 20_000,
+                    "tax_unit_role_input": "HEAD",
+                    "is_household_head": True,
+                },
+                {"age": 3, "tax_unit_role_input": "DEPENDENT"},
+            ],
             groups=groups,
             year=scenario.year,
         )
@@ -506,6 +514,9 @@ def memory_preflight(identity, output):
         new_totals, _, new_vectors = totals(new, scenario.year, "OR")
         if old_totals != new_totals:
             raise ValueError(f"Supported reform changed actual totals for {name}")
+        expected_credit = parameters[str(scenario.year)][f"{CTC}.amount"]
+        if abs(new_totals["or_ctc"] - expected_credit) > 0.01:
+            raise ValueError(f"Synthetic eligible credit was not exercised for {name}")
         for variable in VARIABLES:
             if not old_vectors[variable].equals(new_vectors[variable]) or not (
                 old_vectors[variable].weights.equals(new_vectors[variable].weights)
