@@ -6,6 +6,7 @@ interpreter. The host heavy-run wrapper must own every population command.
 """
 
 import argparse
+import gc
 import hashlib
 import importlib.metadata as metadata
 import json
@@ -305,33 +306,37 @@ def preflight(pe, identity, output):
 
 
 def snapshot(pe, identity, year, region, output, scenario_name=None):
-    kwargs = {}
     scenario = SCENARIOS[scenario_name] if scenario_name else None
     if scenario:
-        from policyengine_core.reforms import Reform
-        from policyengine_us import CountryTaxBenefitSystem
-
         if year != scenario.year or region != "OR":
             raise ValueError("Policy snapshot must use its scenario's Oregon/year")
-        # Supply an already reformed system through the supported constructor
-        # surface. Passing reform= also retains a second baseline population.
-        kwargs["tax_benefit_system"] = CountryTaxBenefitSystem(
-            reform=(Reform.from_dict(scenario.reform(), country_id="us"),)
-        )
     progress("construct_start", scenario=scenario_name, year=year, region=region)
     simulation = pe.us.managed_microsimulation(
-        dataset="populace_us_2024", dataset_end_year=2029, **kwargs
+        dataset="populace_us_2024", dataset_end_year=2029
     )
+    if scenario:
+        apply_scenario(simulation, scenario)
     if simulation.baseline is not None:
         raise ValueError("A snapshot must retain only its own population branch")
     progress("construct_complete", scenario=scenario_name, year=year, region=region)
     source_inputs = input_audit(simulation)
     fingerprints = covariate_fingerprints(simulation, year)
     values, mask, accounting_vectors = totals(simulation, year, region)
+    parameters = parameter_values(simulation.tax_benefit_system)
+    bundle = simulation.policyengine_bundle
+    health = bool(
+        simulation.tax_benefit_system.parameters(
+            f"{year}-01-01"
+        ).gov.simulation.include_health_benefits_in_net_income
+    )
+    records = len(mask[mask])
+    vector = accounting_vectors["household_net_income"]
+    # All model calculations and metadata extraction are finished. The saved
+    # native vectors own the values/indexes/weights needed by the receipt.
+    del simulation, mask
+    gc.collect()
+    progress("simulation_released", scenario=scenario_name, year=year, region=region)
     check, absolute_masses = native_accounting_check(accounting_vectors)
-    vector = simulation.calc("household_net_income", period=year, map_to="household")[
-        mask
-    ]
     vector_path = Path(output).with_suffix(".households.pkl")
     vector_path.parent.mkdir(parents=True, exist_ok=True)
     # Native MicroSeries serialization preserves its weights and row index.
@@ -351,20 +356,23 @@ def snapshot(pe, identity, year, region, output, scenario_name=None):
             "scenario": scenario_name,
             "reform": scenario.reform() if scenario else {},
             "totals": values,
-            "household_records": len(mask[mask]),
+            "household_records": records,
             "covariate_fingerprints": fingerprints,
             "source_input_audit": source_inputs,
             "household_vector_file": vector_path.name,
             "household_vector_sha256": sha256(vector_path),
             "accounting_components_file": components_path.name,
             "accounting_components_sha256": sha256(components_path),
-            "health_in_household_benefits": bool(
-                simulation.tax_benefit_system.parameters(
-                    f"{year}-01-01"
-                ).gov.simulation.include_health_benefits_in_net_income
-            ),
-            "parameters": parameter_values(simulation.tax_benefit_system),
-            "bundle": simulation.policyengine_bundle,
+            "health_in_household_benefits": health,
+            "parameters": parameters,
+            "bundle": bundle,
+            "simulation_configuration": {
+                "initialization": "managed_current_law_then_apply_reform"
+                if scenario
+                else "managed_current_law",
+                "post_calculation_lifecycle": "release_before_receipt_validation",
+                "dataset_end_year": 2029,
+            },
             "accounting_residual": check["residual"],
             "accounting_check": check,
             "accounting_absolute_masses": absolute_masses,
@@ -378,6 +386,13 @@ def snapshot(pe, identity, year, region, output, scenario_name=None):
             f"Household accounting fails: {check}; actual checkpoint saved for audit"
         )
     progress("snapshot_complete", scenario=scenario_name, year=year, region=region)
+
+
+def apply_scenario(simulation, scenario):
+    """Use the engine's isolated parameter-write and cache invalidation path."""
+    from policyengine_core.reforms import Reform
+
+    simulation.apply_reform(Reform.from_dict(scenario.reform(), country_id="us"))
 
 
 def split_preflight(identity, output):
@@ -420,6 +435,127 @@ def split_preflight(identity, output):
     write_json(
         output,
         {"status": "passed", "runtime": identity.model_dump(), "synthetic": checked},
+    )
+
+
+def input_fingerprints(simulation, year):
+    """Fingerprint native input values only; never construct analysis weights."""
+    return {
+        name: hashlib.sha256(
+            simulation.calc(name, period=year)
+            .to_json(orient="split", double_precision=15)
+            .encode()
+        ).hexdigest()
+        for name in sorted(simulation.input_variables)
+    }
+
+
+def memory_preflight(identity, output):
+    from policyengine.tax_benefit_models.us.household import _build_situation
+    from policyengine_core.reforms import Reform
+    from policyengine_us import CountryTaxBenefitSystem, Microsimulation
+
+    # Identical to the input-only subclass used by the upstream US model.run:
+    # an explicit synthetic household must not load the default population.
+    class InputMicrosimulation(Microsimulation):
+        default_dataset = None
+
+    checked = {}
+    for name, scenario in SCENARIOS.items():
+        groups = {
+            entity: [{"members": [0, 1]}]
+            for entity in (
+                "marital_unit",
+                "family",
+                "spm_unit",
+                "tax_unit",
+                "household",
+            )
+        }
+        groups["household"][0].update(
+            state_code="OR", state_fips=41, county_fips="41051", household_weight=1.0
+        )
+        groups["tax_unit"][0].update(filing_status="HEAD_OF_HOUSEHOLD")
+        situation = _build_situation(
+            people=[
+                {
+                    "age": 40,
+                    "employment_income": 20_000,
+                    "tax_unit_role_input": "HEAD",
+                    "is_household_head": True,
+                },
+                {"age": 3, "tax_unit_role_input": "DEPENDENT"},
+            ],
+            groups=groups,
+            year=scenario.year,
+        )
+        old = InputMicrosimulation(
+            situation=situation,
+            tax_benefit_system=CountryTaxBenefitSystem(
+                reform=(Reform.from_dict(scenario.reform(), country_id="us"),)
+            ),
+        )
+        new = InputMicrosimulation(situation=situation)
+        before = input_fingerprints(new, scenario.year)
+        original_parameters = parameter_values(new.tax_benefit_system)
+        apply_scenario(new, scenario)
+        after = input_fingerprints(new, scenario.year)
+        if before != after or after != input_fingerprints(old, scenario.year):
+            raise ValueError(f"Supported reform changed synthetic inputs for {name}")
+        parameters = parameter_values(new.tax_benefit_system)
+        if parameters != parameter_values(old.tax_benefit_system):
+            raise ValueError(f"Supported reform changed policy dates for {name}")
+        for year in range(2026, scenario.start_year):
+            if parameters[str(year)] != original_parameters[str(year)]:
+                raise ValueError(f"Future policy changed an earlier year for {name}")
+        if old.baseline is not None or new.baseline is not None:
+            raise ValueError("A single-population preflight retained a baseline")
+        old_totals, _, old_vectors = totals(old, scenario.year, "OR")
+        new_totals, _, new_vectors = totals(new, scenario.year, "OR")
+        if old_totals != new_totals:
+            raise ValueError(f"Supported reform changed actual totals for {name}")
+        expected_credit = parameters[str(scenario.year)][f"{CTC}.amount"]
+        if abs(new_totals["or_ctc"] - expected_credit) > 0.01:
+            raise ValueError(f"Synthetic eligible credit was not exercised for {name}")
+        for variable in VARIABLES:
+            if not old_vectors[variable].equals(new_vectors[variable]) or not (
+                old_vectors[variable].weights.equals(new_vectors[variable].weights)
+            ):
+                raise ValueError(
+                    f"Supported reform changed native {variable} for {name}"
+                )
+        if (
+            old.spm_config != new.spm_config
+            or old.spm_provenance() != new.spm_provenance()
+        ):
+            raise ValueError(f"Supported reform changed SPM receipts for {name}")
+        record = {
+            "parameters": parameters,
+            "native_input_fingerprints": after,
+            "spm_configuration": new.spm_config,
+            "spm_provenance": new.spm_provenance(),
+            "synthetic_totals": new_totals,
+        }
+        del old, new
+        gc.collect()
+        check, _ = native_accounting_check(new_vectors)
+        if not check["passed"] or any(
+            float(new_vectors[variable].sum()) != new_totals[variable]
+            for variable in VARIABLES
+        ):
+            raise ValueError(f"Simulation release changed native values for {name}")
+        record["post_release_accounting_check"] = check
+        checked[name] = record
+        del old_vectors, new_vectors
+        gc.collect()
+    write_json(
+        output,
+        {
+            "status": "passed",
+            "runtime": identity.model_dump(),
+            "scenarios": checked,
+            "analysis_runner_sha256": sha256(__file__),
+        },
     )
 
 
@@ -610,7 +746,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "mode",
-        choices=("preflight", "split-preflight", "scenario", "snapshot", "compare"),
+        choices=(
+            "preflight",
+            "split-preflight",
+            "memory-preflight",
+            "scenario",
+            "snapshot",
+            "compare",
+        ),
     )
     parser.add_argument(
         "--role", choices=("baseline", "candidate"), default="candidate"
@@ -642,6 +785,8 @@ def main():
         preflight(pe, identity, args.output)
     elif args.mode == "split-preflight":
         split_preflight(identity, args.output)
+    elif args.mode == "memory-preflight":
+        memory_preflight(identity, args.output)
     else:
         snapshot(pe, identity, args.year, args.region, args.output, args.scenario)
 
