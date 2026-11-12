@@ -10,6 +10,8 @@ import hashlib
 import importlib.metadata as metadata
 import json
 import os
+import pickle
+import resource
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -143,9 +145,24 @@ def parameter_values(system):
     }
 
 
-def covariate_fingerprints(simulation):
+def progress(event, **details):
+    print(
+        json.dumps(
+            {
+                "at": datetime.now(UTC).isoformat(),
+                "event": event,
+                "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                * (1 if sys.platform == "darwin" else 1024),
+                **details,
+            }
+        ),
+        flush=True,
+    )
+
+
+def covariate_fingerprints(simulation, year):
     # Serialization serves only identity checks; every estimate retains MicroSeries.
-    return {
+    fingerprints = {
         f"{entity}.{variable}": hashlib.sha256(
             simulation.calc(variable, period=2024, map_to=entity)
             .to_json(orient="split", double_precision=15)
@@ -153,6 +170,12 @@ def covariate_fingerprints(simulation):
         ).hexdigest()
         for variable, entity in COVARIATES
     }
+    for period in (2024, year):
+        values = simulation.calc("household_weight", period=period, map_to="household")
+        fingerprints[f"household.household_weight.{period}"] = hashlib.sha256(
+            values.to_json(orient="split", double_precision=15).encode()
+        ).hexdigest()
+    return fingerprints
 
 
 def totals(simulation, year, region):
@@ -160,12 +183,55 @@ def totals(simulation, year, region):
     mask = geography == 41 if region == "OR" else geography == geography
     output = {}
     for variable in VARIABLES:
+        progress("calculate_start", variable=variable, year=year)
         values = simulation.calc(variable, period=year, map_to="household")
         if values.isna().any():
             raise ValueError(f"Missing {variable} values before geographic aggregation")
         output[variable] = float(values[mask].sum())
+        progress("calculate_complete", variable=variable, year=year)
     output["households"] = float((geography[mask] == geography[mask]).sum())
     return output, mask
+
+
+def input_audit(simulation):
+    tables = simulation.dataset.datasets[2024]
+    unknown = {}
+    for entity in (
+        "person",
+        "household",
+        "tax_unit",
+        "spm_unit",
+        "family",
+        "marital_unit",
+    ):
+        columns = set(getattr(tables, entity).columns)
+        unknown[entity] = sorted(
+            columns - simulation.tax_benefit_system.variables.keys()
+        )
+    required = {
+        "age",
+        "state_fips",
+        "household_weight",
+        "household_id",
+        "person_id",
+        "person_household_id",
+        "person_tax_unit_id",
+        "person_spm_unit_id",
+        "tax_unit_role_input",
+        "employment_income_before_lsr",
+        "self_employment_income_before_lsr",
+    }
+    missing = required - set(simulation.input_variables)
+    if missing:
+        raise ValueError(
+            f"Critical native source inputs were not loaded: {sorted(missing)}"
+        )
+    return {
+        "unknown_entity_columns": unknown,
+        "unknown_unique_count": len(set().union(*map(set, unknown.values()))),
+        "required_native_inputs_loaded": sorted(required),
+        "legacy_input_renames": simulation.policyengine_bundle["legacy_input_renames"],
+    }
 
 
 def preflight(pe, identity, output):
@@ -228,14 +294,39 @@ def preflight(pe, identity, output):
     )
 
 
-def snapshot(pe, identity, year, region, output):
+def snapshot(pe, identity, year, region, output, scenario_name=None):
+    kwargs = {}
+    scenario = SCENARIOS[scenario_name] if scenario_name else None
+    if scenario:
+        from policyengine_core.reforms import Reform
+        from policyengine_us import CountryTaxBenefitSystem
+
+        if year != scenario.year or region != "OR":
+            raise ValueError("Policy snapshot must use its scenario's Oregon/year")
+        # Supply an already reformed system through the supported constructor
+        # surface. Passing reform= also retains a second baseline population.
+        kwargs["tax_benefit_system"] = CountryTaxBenefitSystem(
+            reform=(Reform.from_dict(scenario.reform(), country_id="us"),)
+        )
+    progress("construct_start", scenario=scenario_name, year=year, region=region)
     simulation = pe.us.managed_microsimulation(
-        dataset="populace_us_2024", dataset_end_year=2029
+        dataset="populace_us_2024", dataset_end_year=2029, **kwargs
     )
+    if simulation.baseline is not None:
+        raise ValueError("A snapshot must retain only its own population branch")
+    progress("construct_complete", scenario=scenario_name, year=year, region=region)
+    source_inputs = input_audit(simulation)
+    fingerprints = covariate_fingerprints(simulation, year)
     values, mask = totals(simulation, year, region)
     residual = accounting_residual(values)
-    if abs(residual) > 5:
-        raise ValueError(f"Household accounting fails by {residual}")
+    vector = simulation.calc("household_net_income", period=year, map_to="household")[
+        mask
+    ]
+    vector_path = Path(output).with_suffix(".households.pkl")
+    vector_path.parent.mkdir(parents=True, exist_ok=True)
+    # Native MicroSeries serialization preserves its weights and row index.
+    # This ignored local file contains microdata and must never be published.
+    vector_path.write_bytes(pickle.dumps(vector, protocol=pickle.HIGHEST_PROTOCOL))
     write_json(
         output,
         {
@@ -243,9 +334,14 @@ def snapshot(pe, identity, year, region, output):
             "runtime": identity.model_dump(),
             "year": year,
             "region": region,
+            "scenario": scenario_name,
+            "reform": scenario.reform() if scenario else {},
             "totals": values,
             "household_records": len(mask[mask]),
-            "covariate_fingerprints": covariate_fingerprints(simulation),
+            "covariate_fingerprints": fingerprints,
+            "source_input_audit": source_inputs,
+            "household_vector_file": vector_path.name,
+            "household_vector_sha256": sha256(vector_path),
             "health_in_household_benefits": bool(
                 simulation.tax_benefit_system.parameters(
                     f"{year}-01-01"
@@ -254,28 +350,111 @@ def snapshot(pe, identity, year, region, output):
             "parameters": parameter_values(simulation.tax_benefit_system),
             "bundle": simulation.policyengine_bundle,
             "accounting_residual": residual,
+            "accounting_status": "passed" if abs(residual) <= 5 else "failed",
+            "analysis_runner_sha256": sha256(__file__),
             "completed_at": datetime.now(UTC).isoformat(),
         },
     )
-
-
-def comparison(pe, identity, name, output):
-    scenario = SCENARIOS[name]
-    simulation = pe.us.managed_microsimulation(
-        dataset="populace_us_2024", dataset_end_year=2029, reform=scenario.reform()
-    )
-    baseline = simulation.baseline
-    if baseline is None:
-        raise ValueError("Expected the reform's actual baseline branch")
-    covariates = covariate_fingerprints(baseline)
-    if covariates != covariate_fingerprints(simulation):
+    if abs(residual) > 5:
         raise ValueError(
-            "Policy changes altered source covariates or native memberships"
+            f"Household accounting fails by {residual}; "
+            "actual checkpoint saved for audit"
         )
-    base, mask = totals(baseline, scenario.year, "OR")
-    ref, other_mask = totals(simulation, scenario.year, "OR")
-    if not mask.equals(other_mask):
-        raise ValueError("Baseline and reform geographic rows differ")
+    progress("snapshot_complete", scenario=scenario_name, year=year, region=region)
+
+
+def split_preflight(identity, output):
+    from policyengine.tax_benefit_models.us.household import _build_situation
+    from policyengine_core.reforms import Reform
+    from policyengine_us import CountryTaxBenefitSystem, Simulation
+
+    scenario = SCENARIOS["expanded_renewal_2029"]
+    groups = {
+        entity: [{"members": [0, 1]}]
+        for entity in ("marital_unit", "family", "spm_unit", "tax_unit", "household")
+    }
+    groups["household"][0].update(state_code="OR", county_fips="41051")
+    groups["tax_unit"][0].update(filing_status="HEAD_OF_HOUSEHOLD")
+    situation = _build_situation(
+        people=[{"age": 40, "employment_income": 20_000}, {"age": 3}],
+        groups=groups,
+        year=scenario.year,
+    )
+    standard = Simulation(situation=situation, reform=scenario.reform())
+    system = CountryTaxBenefitSystem(
+        reform=(Reform.from_dict(scenario.reform(), country_id="us"),)
+    )
+    single = Simulation(situation=situation, tax_benefit_system=system)
+    if single.baseline is not None:
+        raise ValueError("Explicit-system constructor retained a baseline population")
+    if parameter_values(standard.tax_benefit_system) != parameter_values(
+        single.tax_benefit_system
+    ):
+        raise ValueError("Explicit-system policy parameters differ")
+    checked = {}
+    for variable in ("or_ctc", "or_agi", "state_income_tax", "household_net_income"):
+        left, right = (
+            simulation.calculate(variable, scenario.year)
+            for simulation in (standard, single)
+        )
+        if not (left == right).all():
+            raise ValueError(f"Explicit-system household values differ for {variable}")
+        checked[variable] = float(right[0])
+    write_json(
+        output,
+        {"status": "passed", "runtime": identity.model_dump(), "synthetic": checked},
+    )
+
+
+def load_snapshot(path):
+    return json.loads(Path(path).read_text())
+
+
+def validate_snapshot_pair(base, ref):
+    if any(row.get("accounting_status") != "passed" for row in (base, ref)):
+        raise ValueError("Snapshots have not passed their accounting checks")
+    if (base["year"], base["region"]) != (ref["year"], ref["region"]):
+        raise ValueError("Snapshot year/region mismatch")
+    if base["runtime"]["data_sha256"] != ref["runtime"]["data_sha256"]:
+        raise ValueError("Snapshot data differ")
+    if base["covariate_fingerprints"] != ref["covariate_fingerprints"]:
+        raise ValueError("Source covariates, memberships or weights differ")
+    if base["health_in_household_benefits"] != ref["health_in_household_benefits"]:
+        raise ValueError("Health accounting settings differ")
+
+
+def load_household_vector(snapshot_path, snapshot):
+    from microdf import MicroSeries
+
+    path = Path(snapshot_path).parent / snapshot["household_vector_file"]
+    if path.parent.resolve() != Path(snapshot_path).parent.resolve():
+        raise ValueError("Household vector must be beside its snapshot")
+    if sha256(path) != snapshot["household_vector_sha256"]:
+        raise ValueError("Native household vector fingerprint mismatch")
+    # Only load files produced locally by this script, never untrusted pickles.
+    values = pickle.loads(path.read_bytes())
+    if not isinstance(values, MicroSeries):
+        raise ValueError("Household values lost their native MicroSeries type")
+    return values
+
+
+def comparison(left, right, name, output):
+    scenario = SCENARIOS[name]
+    base_snapshot, ref_snapshot = (load_snapshot(path) for path in (left, right))
+    validate_snapshot_pair(base_snapshot, ref_snapshot)
+    if base_snapshot["runtime"] != ref_snapshot["runtime"]:
+        raise ValueError("Policy snapshots must use the identical model runtime")
+    if base_snapshot["reform"] or ref_snapshot["reform"] != scenario.reform():
+        raise ValueError("Policy snapshots do not match current law and this reform")
+    if ref_snapshot["scenario"] != name or ref_snapshot["year"] != scenario.year:
+        raise ValueError("Policy snapshot scenario/year mismatch")
+    base_vector = load_household_vector(left, base_snapshot)
+    ref_vector = load_household_vector(right, ref_snapshot)
+    if not base_vector.index.equals(ref_vector.index) or not base_vector.weights.equals(
+        ref_vector.weights
+    ):
+        raise ValueError("Native household row indexes or weights differ")
+    base, ref = base_snapshot["totals"], ref_snapshot["totals"]
     changes = {variable: ref[variable] - base[variable] for variable in base}
     residuals = {
         "baseline": accounting_residual(base),
@@ -283,28 +462,22 @@ def comparison(pe, identity, name, output):
     }
     if any(abs(value) > 5 for value in residuals.values()):
         raise ValueError(f"Household accounting fails: {residuals}")
-    gain = simulation.calc(
-        "household_net_income", period=scenario.year, map_to="household"
-    ) - baseline.calc("household_net_income", period=scenario.year, map_to="household")
-    health = bool(
-        baseline.tax_benefit_system.parameters(
-            f"{scenario.year}-01-01"
-        ).gov.simulation.include_health_benefits_in_net_income
-    )
+    gain = ref_vector - base_vector
+    health = base_snapshot["health_in_household_benefits"]
     result = ComparisonResult(
         scenario=name,
         year=scenario.year,
         limitations=LIMITATIONS,
         assumptions=ASSUMPTIONS,
-        runtime=identity,
+        runtime=RuntimeIdentity.model_validate(ref_snapshot["runtime"]),
         reform=scenario.reform(),
         baseline_totals=base,
         reform_totals=ref,
         changes=changes,
         budget=budget_impact(changes, health_in_household_benefits=health),
-        households_gaining=float((gain[mask] > 0.01).sum()),
-        households_losing=float((gain[mask] < -0.01).sum()),
-        oregon_household_records=len(mask[mask]),
+        households_gaining=float((gain > 0.01).sum()),
+        households_losing=float((gain < -0.01).sum()),
+        oregon_household_records=len(gain),
         covariates_preserved=True,
         accounting_residuals=residuals,
         completed_at=datetime.now(UTC).isoformat(),
@@ -313,27 +486,21 @@ def comparison(pe, identity, name, output):
         output,
         {
             **result.model_dump(),
-            "bundle": simulation.policyengine_bundle,
-            "baseline_parameters": parameter_values(baseline.tax_benefit_system),
-            "reform_parameters": parameter_values(simulation.tax_benefit_system),
+            "bundle": ref_snapshot["bundle"],
+            "baseline_parameters": base_snapshot["parameters"],
+            "reform_parameters": ref_snapshot["parameters"],
+            "snapshot_sha256": {"baseline": sha256(left), "reform": sha256(right)},
         },
     )
 
 
 def compare_snapshots(left, right, output):
-    base, ref = (json.loads(Path(path).read_text()) for path in (left, right))
-    if (base["year"], base["region"]) != (ref["year"], ref["region"]):
-        raise ValueError("Snapshot year/region mismatch")
-    if base["runtime"]["data_sha256"] != ref["runtime"]["data_sha256"]:
-        raise ValueError("Snapshot data differ")
-    if base["covariate_fingerprints"] != ref["covariate_fingerprints"]:
-        raise ValueError("Source covariates differ between model snapshots")
+    base, ref = (load_snapshot(path) for path in (left, right))
+    validate_snapshot_pair(base, ref)
     changes = {
         variable: ref["totals"][variable] - value
         for variable, value in base["totals"].items()
     }
-    if base["health_in_household_benefits"] != ref["health_in_household_benefits"]:
-        raise ValueError("Health accounting settings differ")
     budget = budget_impact(
         changes, health_in_household_benefits=base["health_in_household_benefits"]
     )
@@ -360,7 +527,8 @@ def compare_snapshots(left, right, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "mode", choices=("preflight", "scenario", "snapshot", "compare")
+        "mode",
+        choices=("preflight", "split-preflight", "scenario", "snapshot", "compare"),
     )
     parser.add_argument(
         "--role", choices=("baseline", "candidate"), default="candidate"
@@ -372,18 +540,28 @@ def main():
     parser.add_argument("--candidate-snapshot", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.mode == "compare":
+    if args.mode in {"compare", "scenario"}:
+        if not args.baseline_snapshot or not args.candidate_snapshot:
+            parser.error("Comparison needs both saved actual snapshots")
+        if args.mode == "scenario":
+            if args.scenario is None:
+                parser.error("scenario mode needs --scenario")
+            comparison(
+                args.baseline_snapshot,
+                args.candidate_snapshot,
+                args.scenario,
+                args.output,
+            )
+            return
         compare_snapshots(args.baseline_snapshot, args.candidate_snapshot, args.output)
         return
     pe, identity = activate(args.role)
     if args.mode == "preflight":
         preflight(pe, identity, args.output)
-    elif args.mode == "scenario":
-        if args.scenario is None:
-            parser.error("scenario mode needs --scenario")
-        comparison(pe, identity, args.scenario, args.output)
+    elif args.mode == "split-preflight":
+        split_preflight(identity, args.output)
     else:
-        snapshot(pe, identity, args.year, args.region, args.output)
+        snapshot(pe, identity, args.year, args.region, args.output, args.scenario)
 
 
 if __name__ == "__main__":

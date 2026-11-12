@@ -45,7 +45,9 @@ cd .runtime/policyengine-6.17.2
   preflight --role candidate --output "$OREGON_ANALYSIS_ROOT/results/preflight-candidate.json"
 ```
 
-Population commands use the same launch form under the host's heavy-run wrapper. Replace `preflight` with `scenario --scenario expansion_2027` (or another scenario name) for a policy comparison. Use `snapshot --year 2026 --region us` under each role for the national CPI comparison, then `compare --baseline-snapshot FILE --candidate-snapshot FILE --output FILE` to compare their actual aggregates. Set BLAS/OpenMP thread limits to at most four before launching; local runs use one thread.
+Population commands use the same launch form under the host's heavy-run wrapper. Run `snapshot --year 2027 --region OR` for current law, and `snapshot --year 2027 --region OR --scenario expansion_2027` for its reform, with separate output files and processes. Then run `scenario --scenario expansion_2027 --baseline-snapshot FILE --candidate-snapshot FILE --output FILE` to compare them. Repeat for the other scenarios. The two 2029 renewals may share the same actual current-law snapshot when its runtime and data fingerprints match.
+
+Use `snapshot --year 2026 --region us` under each role for the national CPI comparison, then `compare --baseline-snapshot FILE --candidate-snapshot FILE --output FILE` to compare their actual aggregates. Snapshots retain native `MicroSeries` objects in ignored local pickle files so comparisons preserve household indexes and weights. These files contain microdata: keep them local and load only files created by this script. Set BLAS/OpenMP thread limits to at most four before launching; local runs use one thread.
 
 All aggregates use `MicroSeries` operations and `map_to`. Budget accounting includes taxes, cash and in-kind benefits, and shared government health costs, following [PolicyEngine's budgetary-impact definition](https://github.com/PolicyEngine/policyengine.py/blob/5b6d7901cf93ffbc903874aa305689c03fcb9247/src/policyengine/tax_benefit_models/us/analysis.py). Direct credit outlays remain a separate measure.
 

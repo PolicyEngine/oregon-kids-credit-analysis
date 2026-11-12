@@ -1,5 +1,6 @@
 """Guard policy timing, weighted accounting and development-result labels."""
 
+import pickle
 import runpy
 from pathlib import Path
 
@@ -121,3 +122,14 @@ def test_result_provenance_omits_local_directories_and_preserves_artifact_identi
         "nested": ["local:data.h5", "hf://dataset/source@revision"],
     }
     assert source["wheel"].startswith("file:///private/")
+
+
+def test_native_snapshot_roundtrip_preserves_weighted_difference_and_index():
+    baseline = MicroSeries([1000.0, 2000.0], weights=[2, 7], index=[17, 91])
+    reform = MicroSeries([1100.0, 2020.0], weights=[2, 7], index=[17, 91])
+    loaded = [pickle.loads(pickle.dumps(values)) for values in (baseline, reform)]
+    assert all(isinstance(values, MicroSeries) for values in loaded)
+    assert loaded[0].index.equals(baseline.index)
+    assert loaded[0].weights.equals(baseline.weights)
+    assert (loaded[1] - loaded[0]).sum() == 340
+    assert ((loaded[1] - loaded[0]) > 0).sum() == 9
