@@ -20,6 +20,7 @@ SPM_VERSION = "1.1.0"
 SPM_WHEEL_SHA = "c528ec0f06eeb1188b7d6cf456ff3a9b73a0fd8856b3938358251cc5f9be83e8"
 SPM_FORECAST_SHA = "335e6755dc8e0bd883e09b76c2bd53a5315683773e44d50085c7d6b8832b6291"
 CORE_VERSION = "3.34.2"
+REGIONAL_WRAPPER_COMMIT = "e5e18f80070c50c353f2d65130f0f10e180df770"
 
 
 def sha256(path: Path) -> str:
@@ -78,6 +79,61 @@ def verify_model_source(wheel: Path, source: Path, commit: str):
     return checked
 
 
+def verify_wrapper_source(wheel: Path, source: Path, commit: str):
+    """Authenticate the explicitly selected, publicly reviewed adapter build."""
+    if commit != REGIONAL_WRAPPER_COMMIT:
+        raise ValueError("Unrecognized regional wrapper source commit")
+    actual = subprocess.check_output(
+        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+    ).strip()
+    if actual != commit:
+        raise ValueError("Wrapper HEAD differs from requested public commit")
+    remote = subprocess.check_output(
+        ["git", "-C", str(source), "remote", "get-url", "origin"], text=True
+    ).strip()
+    if remote != "https://github.com/PolicyEngine/policyengine.py.git":
+        raise ValueError("Wrapper source must use the canonical upstream remote")
+    dirty = subprocess.check_output(
+        ["git", "-C", str(source), "status", "--porcelain", "--", "src/policyengine"],
+        text=True,
+    )
+    if dirty:
+        raise ValueError("Wrapper package source has uncommitted changes")
+    checked = 0
+    tracked = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(source),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            commit,
+            "src/policyengine",
+        ],
+        text=True,
+    ).splitlines()
+    expected_members = {name.removeprefix("src/") for name in tracked}
+    with zipfile.ZipFile(wheel) as archive:
+        members = {
+            name
+            for name in archive.namelist()
+            if name.startswith("policyengine/") and not name.endswith("/")
+        }
+        if members != expected_members:
+            raise ValueError("Wrapper wheel package inventory differs from source")
+        for member in archive.namelist():
+            if not member.startswith("policyengine/") or member.endswith("/"):
+                continue
+            local = source / "src" / member
+            if not local.is_file() or local.read_bytes() != archive.read(member):
+                raise ValueError(f"Wrapper wheel differs from source: {member}")
+            checked += 1
+    if not checked:
+        raise ValueError("Wrapper wheel contains no package files")
+    return checked
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare-only", action="store_true")
@@ -85,6 +141,10 @@ def main():
     parser.add_argument("--model-wheel", type=Path)
     parser.add_argument("--model-source", type=Path)
     parser.add_argument("--model-commit")
+    parser.add_argument("--wrapper-wheel", type=Path)
+    parser.add_argument("--wrapper-source", type=Path)
+    parser.add_argument("--wrapper-commit")
+    parser.add_argument("--runtime-prefix", choices=("regional",))
     args = parser.parse_args()
     wrapper_wheel, wrapper_info = artifact(
         "policyengine", WRAPPER_VERSION, ".whl", WRAPPER_WHEEL_SHA
@@ -94,6 +154,25 @@ def main():
     )
     core_wheel, core_info = artifact("policyengine-core", CORE_VERSION, ".whl")
     spm_wheel, spm_info = artifact("spm-calculator", SPM_VERSION, ".whl", SPM_WHEEL_SHA)
+    override = (args.wrapper_wheel, args.wrapper_source, args.wrapper_commit)
+    if any(override) or args.runtime_prefix:
+        if not all(override) or args.runtime_prefix != "regional" or args.prepare_only:
+            parser.error(
+                "Source wrapper builds require all wrapper arguments "
+                "and --runtime-prefix regional"
+            )
+        wrapper_wheel = args.wrapper_wheel.resolve(strict=True)
+        wrapper_files = verify_wrapper_source(
+            wrapper_wheel, args.wrapper_source.resolve(), args.wrapper_commit
+        )
+        wrapper_info = {
+            "version": WRAPPER_VERSION,
+            "source_commit": args.wrapper_commit,
+            "source_repository": "https://github.com/PolicyEngine/policyengine.py",
+            "sha256": sha256(wrapper_wheel),
+            "build_status": "unreleased_source_build",
+            "package_files_verified": wrapper_files,
+        }
     source = RUNTIME / f"policyengine-{WRAPPER_VERSION}"
     if not source.exists():
         with tarfile.open(fileobj=io.BytesIO(source_archive.read_bytes())) as archive:
@@ -116,7 +195,10 @@ def main():
         "core_version": CORE_VERSION,
         "core": core_info,
     }
-    (RUNTIME / "upstream-artifacts.json").write_text(json.dumps(identities, indent=2))
+    suffix = f"-{args.runtime_prefix}" if args.runtime_prefix else ""
+    (RUNTIME / f"upstream-artifacts{suffix}.json").write_text(
+        json.dumps(identities, indent=2)
+    )
     if args.prepare_only:
         print(json.dumps({"source": str(source), "artifacts": identities}, indent=2))
         return
@@ -126,7 +208,8 @@ def main():
         )
     wheel = args.model_wheel.resolve(strict=True)
     checked = verify_model_source(wheel, args.model_source.resolve(), args.model_commit)
-    env = RUNTIME / f"env-{args.role}"
+    name = f"{args.runtime_prefix}-{args.role}" if args.runtime_prefix else args.role
+    env = RUNTIME / f"env-{name}"
     python = env / "bin/python"
     if not python.exists():
         subprocess.run(["uv", "venv", "--python", "3.13", str(env)], check=True)
@@ -145,7 +228,7 @@ def main():
         ],
         check=True,
     )
-    manifest = RUNTIME / f"development-{args.role}.json"
+    manifest = RUNTIME / f"development-{name}.json"
     subprocess.run(
         [
             str(python),
@@ -168,8 +251,8 @@ def main():
 import importlib.metadata as m, sys, zipfile
 from pathlib import Path
 for package, module, wheel in zip(
-    ('policyengine-core', 'spm-calculator'),
-    ('policyengine_core', 'spm_calculator'), sys.argv[1:]
+    ('policyengine-core', 'spm-calculator', 'policyengine'),
+    ('policyengine_core', 'spm_calculator', 'policyengine'), sys.argv[1:]
 ):
     with zipfile.ZipFile(wheel) as z:
         d = m.distribution(package)
@@ -182,7 +265,15 @@ from spm_calculator import load_forecast
 print(load_forecast().content_sha256)
 """
     forecast_sha = subprocess.check_output(
-        [str(python), "-c", verification, str(core_wheel), str(spm_wheel)], text=True
+        [
+            str(python),
+            "-c",
+            verification,
+            str(core_wheel),
+            str(spm_wheel),
+            str(wrapper_wheel),
+        ],
+        text=True,
     ).strip()
     if forecast_sha != SPM_FORECAST_SHA:
         raise ValueError("The authenticated SPM forecast differs from its recorded pin")
@@ -227,16 +318,17 @@ path.write_text(json.dumps(updated, indent=2) + '\\n')
         "model_wheel_sha256": sha256(wheel),
         "model_package_files_verified": checked,
         "model_wheel": str(wheel),
+        "wrapper_wheel": str(wrapper_wheel),
         "source": str(source),
         "development_manifest": str(manifest),
         "python": str(python),
         "forecast_content_sha256": forecast_sha,
     }
-    (RUNTIME / f"runtime-{args.role}.json").write_text(json.dumps(identity, indent=2))
+    (RUNTIME / f"runtime-{name}.json").write_text(json.dumps(identity, indent=2))
     freeze = subprocess.check_output(
         ["uv", "pip", "freeze", "--python", str(python)], text=True
     )
-    (RUNTIME / f"lock-{args.role}.txt").write_text(freeze)
+    (RUNTIME / f"lock-{name}.txt").write_text(freeze)
     print(json.dumps(identity, indent=2))
 
 
