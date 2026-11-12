@@ -6,12 +6,15 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     env:
-      OMP_NUM_THREADS: 2
-      OPENBLAS_NUM_THREADS: 2
+      OMP_NUM_THREADS: 1
+      OPENBLAS_NUM_THREADS: 1
+      MKL_NUM_THREADS: 1
+      VECLIB_MAXIMUM_THREADS: 1
+      NUMEXPR_NUM_THREADS: 1
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uv run --python 3.13 --extra test --extra lint ruff check .
-      - run: uv run --python 3.13 --extra test --extra lint ruff format --check .
+      - run: uv run --locked --python 3.13 --extra test --extra lint ruff check .
+      - run: uv run --locked --python 3.13 --extra test --extra lint ruff format --check .
       - run: python scripts/bootstrap_runtime.py --prepare-only
-      - run: uv run --python 3.13 --extra test pytest
+      - run: uv run --locked --python 3.13 --extra test pytest

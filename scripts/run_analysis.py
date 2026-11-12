@@ -70,12 +70,26 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def portable_provenance(value):
+    """Keep artifact identities while omitting machine-local directory names."""
+    if isinstance(value, dict):
+        return {key: portable_provenance(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [portable_provenance(item) for item in value]
+    if isinstance(value, str) and (
+        value.startswith("/") or value.startswith("file://")
+    ):
+        return "local:" + Path(value.removeprefix("file://")).name
+    return value
+
+
 def write_json(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(payload, indent=2, allow_nan=False, default=str) + "\n"
+        json.dumps(portable_provenance(payload), indent=2, allow_nan=False, default=str)
+        + "\n"
     )
     temporary.replace(path)
 
@@ -110,6 +124,7 @@ def activate(role):
         country_wheel_sha256=runtime["model_wheel_sha256"],
         core_version=metadata.version("policyengine-core"),
         spm_version=metadata.version("spm-calculator"),
+        spm_forecast_content_sha256=runtime["forecast_content_sha256"],
         data_sha256=DATA_SHA256,
         data_revision=DATA_REVISION,
         certification="unverified_development_fixture",

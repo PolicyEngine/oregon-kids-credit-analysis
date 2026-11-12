@@ -18,6 +18,7 @@ WRAPPER_WHEEL_SHA = "d86ba67f7093453fbb3249275c1802ed9dbadb06582fddff447f1819584
 WRAPPER_SDIST_SHA = "ba372b9edf2686cd8fd3c6cb2d09a8dc61225ba7e22726746bb2a1e40cac8c9e"
 SPM_VERSION = "1.1.0"
 SPM_WHEEL_SHA = "c528ec0f06eeb1188b7d6cf456ff3a9b73a0fd8856b3938358251cc5f9be83e8"
+SPM_FORECAST_SHA = "335e6755dc8e0bd883e09b76c2bd53a5315683773e44d50085c7d6b8832b6291"
 CORE_VERSION = "3.34.2"
 
 
@@ -161,8 +162,33 @@ def main():
         env={**__import__("os").environ, "POLICYENGINE_SKIP_COUNTRY_IMPORTS": "1"},
         check=True,
     )
+    # Authenticate installed Core and calculator bytes before deriving any
+    # runtime settings. The upstream fixture repeats the calculator check.
+    verification = """
+import importlib.metadata as m, sys, zipfile
+from pathlib import Path
+for package, module, wheel in zip(
+    ('policyengine-core', 'spm-calculator'),
+    ('policyengine_core', 'spm_calculator'), sys.argv[1:]
+):
+    with zipfile.ZipFile(wheel) as z:
+        d = m.distribution(package)
+        for name in z.namelist():
+            if name.startswith(module + '/') and not name.endswith('/'):
+                p = Path(d.locate_file(name))
+                if not p.is_file() or p.read_bytes() != z.read(name):
+                    raise ValueError('Installation differs from wheel: ' + name)
+from spm_calculator import load_forecast
+print(load_forecast().content_sha256)
+"""
+    forecast_sha = subprocess.check_output(
+        [str(python), "-c", verification, str(core_wheel), str(spm_wheel)], text=True
+    ).strip()
+    if forecast_sha != SPM_FORECAST_SHA:
+        raise ValueError("The authenticated SPM forecast differs from its recorded pin")
     # This fixture explicitly denies certification. Record the real Core wheel
-    # used by country-model qualification, rather than inherit the release pin.
+    # and forecast used by this development runtime; inherited release pins are
+    # references, not compatibility claims.
     payload = json.loads(manifest.read_text())
     payload["packages"]["policyengine-core"].update(
         version=CORE_VERSION,
@@ -171,21 +197,30 @@ def main():
         install_requirement=f"policyengine-core=={CORE_VERSION}",
     )
     payload["development"]["core_runtime_override"] = core_info
+    payload["development"]["forecast_runtime_override"] = {
+        "forecast_content_sha256": forecast_sha,
+        "calculator_wheel_sha256": spm_info["sha256"],
+    }
     manifest.write_text(json.dumps(payload, indent=2) + "\n")
-    # The upstream fixture authenticates Core's origin/version; authenticate its
-    # installed package bytes here too, using the official registry wheel.
-    verification = """
-import importlib.metadata as m, sys, zipfile
+    # Use the unchanged upstream configuration function and validators. Its CLI
+    # writes the packaged bundle; this call writes only our development fixture.
+    configure = """
+import json, sys
 from pathlib import Path
-with zipfile.ZipFile(sys.argv[1]) as z:
-    d = m.distribution('policyengine-core')
-    for name in z.namelist():
-        if name.startswith('policyengine_core/') and not name.endswith('/'):
-            p = Path(d.locate_file(name))
-            if not p.is_file() or p.read_bytes() != z.read(name):
-                raise ValueError('Core installation differs from wheel: ' + name)
+sys.path.insert(0, 'scripts')
+from spm_bundle import configure_spm
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text())
+settings = dict(payload['measurements']['spm'], forecast_content_sha256=sys.argv[2])
+updated = configure_spm(payload, settings, None)
+path.write_text(json.dumps(updated, indent=2) + '\\n')
 """
-    subprocess.run([str(python), "-c", verification, str(core_wheel)], check=True)
+    subprocess.run(
+        [str(python), "-c", configure, str(manifest), forecast_sha],
+        cwd=source,
+        env={**__import__("os").environ, "POLICYENGINE_SKIP_COUNTRY_IMPORTS": "1"},
+        check=True,
+    )
     identity = {
         **identities,
         "model_source_commit": args.model_commit,
@@ -195,6 +230,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         "source": str(source),
         "development_manifest": str(manifest),
         "python": str(python),
+        "forecast_content_sha256": forecast_sha,
     }
     (RUNTIME / f"runtime-{args.role}.json").write_text(json.dumps(identity, indent=2))
     freeze = subprocess.check_output(

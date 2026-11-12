@@ -1,5 +1,8 @@
 """Guard policy timing, weighted accounting and development-result labels."""
 
+import runpy
+from pathlib import Path
+
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -101,3 +104,20 @@ def test_baseline_subtraction_retains_microseries_weights():
     baseline = MicroSeries([1000, 2000], weights=[2, 7])
     reform = MicroSeries([1100, 2020], weights=[2, 7])
     assert (reform - baseline).sum() == 340
+
+
+def test_result_provenance_omits_local_directories_and_preserves_artifact_identity():
+    helpers = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "scripts/run_analysis.py")
+    )
+    source = {
+        "wheel": "file:///private/task/model.whl",
+        "sha256": "a" * 64,
+        "nested": ["/private/task/data.h5", "hf://dataset/source@revision"],
+    }
+    assert helpers["portable_provenance"](source) == {
+        "wheel": "local:model.whl",
+        "sha256": "a" * 64,
+        "nested": ["local:data.h5", "hf://dataset/source@revision"],
+    }
+    assert source["wheel"].startswith("file:///private/")

@@ -21,6 +21,7 @@ class RuntimeIdentity(BaseModel):
     country_wheel_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     core_version: str
     spm_version: Literal["1.1.0"]
+    spm_forecast_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     data_sha256: Literal[DATA_SHA256]
     data_revision: Literal[DATA_REVISION]
     certification: Literal["unverified_development_fixture"]

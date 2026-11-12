@@ -20,10 +20,31 @@ Each comparison uses current law under the same country-model wheel. Oregon's cr
 The analysis uses `uv` and Python 3.13. Tests exercise policy dates, weighted filtering, accounting identities and result labels:
 
 ```bash
-uv run --extra test pytest
+uv run --locked --extra test pytest
 ```
 
 The runtime bootstrap authenticates the official PolicyEngine source distribution and SPM wheel against PyPI hashes, then uses PolicyEngine's [development fixture](https://github.com/PolicyEngine/policyengine.py/blob/5b6d7901cf93ffbc903874aa305689c03fcb9247/tests/fixtures/spm_development.py). It checks the installed country/calculator files against their wheel bytes. It preserves existing environments.
+
+Each model needs a clean source checkout, its exact commit, and a wheel built from that checkout. Prepare each role with:
+
+```bash
+uv run --locked python scripts/bootstrap_runtime.py --role candidate \
+  --model-source /path/to/policyengine-us --model-commit COMMIT_SHA \
+  --model-wheel /path/to/policyengine_us.whl
+```
+
+Use `--role baseline` for the comparison model. Both roles use Core 3.34.2 and SPM Calculator 1.1.0. The generated development manifest records the installed Core wheel and SPM forecast fingerprint. Configuration passes through the unchanged upstream validators; the fixture and forecast data remain unchanged. The bootstrap verifies installed Core and calculator files against their authenticated wheels before deriving these settings.
+
+Place the verified source data at `data/populace_us_2024.h5`. Launch the household preflight from the authenticated wrapper source directory, so Python resolves the upstream fixture:
+
+```bash
+export OREGON_ANALYSIS_ROOT="$PWD"
+cd .runtime/policyengine-6.17.2
+../env-candidate/bin/python -c 'import os, runpy; runpy.run_path(os.environ["OREGON_ANALYSIS_ROOT"] + "/scripts/run_analysis.py", run_name="__main__")' \
+  preflight --role candidate --output "$OREGON_ANALYSIS_ROOT/results/preflight-candidate.json"
+```
+
+Population commands use the same launch form under the host's heavy-run wrapper. Replace `preflight` with `scenario --scenario expansion_2027` (or another scenario name) for a policy comparison. Use `snapshot --year 2026 --region us` under each role for the national CPI comparison, then `compare --baseline-snapshot FILE --candidate-snapshot FILE --output FILE` to compare their actual aggregates. Set BLAS/OpenMP thread limits to at most four before launching; local runs use one thread.
 
 All aggregates use `MicroSeries` operations and `map_to`. Budget accounting includes taxes, cash and in-kind benefits, and shared government health costs, following [PolicyEngine's budgetary-impact definition](https://github.com/PolicyEngine/policyengine.py/blob/5b6d7901cf93ffbc903874aa305689c03fcb9247/src/policyengine/tax_benefit_models/us/analysis.py). Direct credit outlays remain a separate measure.
 
