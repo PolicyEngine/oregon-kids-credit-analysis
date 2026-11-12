@@ -184,22 +184,22 @@ def totals(simulation, year, region):
     geography = simulation.calc("state_fips", period=year, map_to="household")
     mask = geography == 41 if region == "OR" else geography == geography
     output = {}
-    accounting_vectors = {}
+    metric_vectors = {}
     for variable in VARIABLES:
         progress("calculate_start", variable=variable, year=year)
         values = simulation.calc(variable, period=year, map_to="household")
         if values.isna().any():
             raise ValueError(f"Missing {variable} values before geographic aggregation")
         output[variable] = float(values[mask].sum())
+        metric_vectors[variable] = values[mask]
         if variable in (*IDENTITY_INPUTS, "household_net_income"):
             if str(values.dtype) != "float32" or str(values.weights.dtype) != "float64":
                 raise ValueError("Accounting precision assumptions differ from runtime")
             if values.weights.isna().any() or (values.weights < 0).any():
                 raise ValueError("Accounting bound requires finite nonnegative weights")
-            accounting_vectors[variable] = values[mask]
         progress("calculate_complete", variable=variable, year=year)
     output["households"] = float((geography[mask] == geography[mask]).sum())
-    return output, mask, accounting_vectors
+    return output, mask, metric_vectors
 
 
 def input_audit(simulation):
@@ -424,20 +424,58 @@ def split_preflight(identity, output):
 
 def load_snapshot(path):
     payload = json.loads(Path(path).read_text())
-    if "accounting_components_file" in payload:
-        components = Path(path).parent / payload["accounting_components_file"]
-        if components.parent.resolve() != Path(path).parent.resolve():
-            raise ValueError("Accounting vectors must be beside their snapshot")
-        if sha256(components) != payload["accounting_components_sha256"]:
-            raise ValueError("Accounting component fingerprint mismatch")
-        vectors = pickle.loads(components.read_bytes())
-        check, masses = native_accounting_check(vectors)
-        if (
-            check != payload["accounting_check"]
-            or masses != payload["accounting_absolute_masses"]
+    required = {"accounting_components_file", "accounting_components_sha256"}
+    if (
+        not required <= payload.keys()
+        or payload.get("accounting_check", {}).get("method")
+        != "exact_core_float32_identity_per_household"
+    ):
+        raise ValueError("Snapshot requires an exact per-household accounting receipt")
+    vectors = load_metric_vectors(path, payload)
+    check, masses = native_accounting_check(vectors)
+    if (
+        not check["passed"]
+        or check != payload["accounting_check"]
+        or masses != payload["accounting_absolute_masses"]
+        or payload.get("accounting_status") != "passed"
+    ):
+        raise ValueError("Per-household accounting receipt does not reproduce/pass")
+    reference = vectors["household_net_income"]
+    if len(reference) != payload["household_records"]:
+        raise ValueError("Snapshot raw household count differs from actual vectors")
+    for name in VARIABLES:
+        value = vectors[name]
+        if not value.index.equals(reference.index) or not value.weights.equals(
+            reference.weights
         ):
-            raise ValueError("Per-household accounting receipt does not reproduce")
+            raise ValueError("Saved metric vectors have different indexes or weights")
+        if value.isna().any() or value.isin([float("inf"), -float("inf")]).any():
+            raise ValueError("Saved metric vectors must be finite")
+        if float(value.sum()) != payload["totals"][name]:
+            raise ValueError(
+                "Snapshot metric/component totals differ from actual vectors"
+            )
+    if float((reference == reference).sum()) != payload["totals"]["households"]:
+        raise ValueError("Snapshot household count differs from actual vectors")
+    if payload["accounting_residual"] != check["residual"]:
+        raise ValueError("Snapshot aggregate residual differs from actual vectors")
     return payload
+
+
+def load_metric_vectors(path, payload):
+    from microdf import MicroSeries
+
+    components = Path(path).parent / payload["accounting_components_file"]
+    if components.parent.resolve() != Path(path).parent.resolve():
+        raise ValueError("Accounting vectors must be beside their snapshot")
+    if sha256(components) != payload["accounting_components_sha256"]:
+        raise ValueError("Accounting component fingerprint mismatch")
+    vectors = pickle.loads(components.read_bytes())
+    if not set(VARIABLES) <= vectors.keys() or not all(
+        isinstance(vectors[name], MicroSeries) for name in VARIABLES
+    ):
+        raise ValueError("Every saved metric must retain its native MicroSeries")
+    return vectors
 
 
 def validate_snapshot_pair(base, ref):
@@ -469,6 +507,9 @@ def load_household_vector(snapshot_path, snapshot):
         raise ValueError("Native vector row count differs from its actual snapshot")
     if abs(float(values.sum()) - snapshot["totals"]["household_net_income"]) > 0.005:
         raise ValueError("Native vector aggregate differs from its actual snapshot")
+    component = load_metric_vectors(snapshot_path, snapshot)["household_net_income"]
+    if not values.equals(component) or not values.weights.equals(component.weights):
+        raise ValueError("Gain vector differs from its actual metric vector")
     return values
 
 

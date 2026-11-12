@@ -40,7 +40,12 @@ def save_synthetic_snapshot(directory, role, *, weights=(2, 7)):
         name: MicroSeries(
             np.array([0, 0], dtype=np.float32), weights=weights, index=vector.index
         )
-        for name in (*IDENTITY_INPUTS, "household_net_income")
+        for name in (
+            *BUDGET_VARIABLES,
+            *IDENTITY_INPUTS,
+            "household_net_income",
+            "or_ctc",
+        )
     }
     vectors["household_net_income"] = vector
     vectors["household_market_income"] = MicroSeries(
@@ -51,13 +56,18 @@ def save_synthetic_snapshot(directory, role, *, weights=(2, 7)):
         weights=weights,
         index=vector.index,
     )
-    totals = dict.fromkeys(BUDGET_VARIABLES, 0.0)
+    vectors["household_tax"] = vectors["household_tax_before_refundable_credits"].copy()
+    vectors["state_income_tax"] = vectors["household_tax"].copy()
+    if reform:
+        vectors["or_ctc"] = MicroSeries(
+            np.array([2, 48], dtype=np.float32), weights=weights, index=vector.index
+        )
+    totals = {}
     totals.update({name: float(values.sum()) for name, values in vectors.items()})
     totals.update(
         household_tax=totals["household_tax_before_refundable_credits"],
         state_income_tax=totals["household_tax_before_refundable_credits"],
-        or_ctc=340.0 if reform else 0.0,
-        households=9.0,
+        households=float((vector == vector).sum()),
     )
     components_data = pickle.dumps(vectors)
     components_path = directory / f"{role}.components.pkl"
@@ -94,6 +104,7 @@ def save_synthetic_snapshot(directory, role, *, weights=(2, 7)):
     check, masses = native_accounting_check(vectors)
     payload["accounting_absolute_masses"] = masses
     payload["accounting_check"] = check
+    payload["accounting_residual"] = check["residual"]
     payload["accounting_components_file"] = components_path.name
     payload["accounting_components_sha256"] = hashlib.sha256(
         components_data
@@ -126,7 +137,7 @@ def test_split_comparison_rejects_changed_weight_metadata(tmp_path, runner):
 @pytest.mark.parametrize(
     ("field", "replacement", "message"),
     [
-        ("accounting_status", "failed", "accounting checks"),
+        ("accounting_status", "failed", "receipt does not reproduce/pass"),
         ("covariate_fingerprints", {"source": "different"}, "covariates"),
         ("reform", {}, "this reform"),
     ],
@@ -141,4 +152,43 @@ def test_split_comparison_rejects_unqualified_pair(
     payload[field] = replacement
     ref.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match=message):
+        runner["comparison"](base, ref, "expansion_2027", tmp_path / "result.json")
+
+
+@pytest.mark.parametrize("metric", ["household_benefits", "household_tax", "or_ctc"])
+def test_snapshot_rejects_changed_json_metric_without_changed_actual_vector(
+    tmp_path, runner, metric
+):
+    path = save_synthetic_snapshot(tmp_path, "reform")
+    payload = json.loads(path.read_text())
+    payload["totals"][metric] += 1_000_000
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="metric/component totals"):
+        runner["load_snapshot"](path)
+
+
+def test_snapshot_rejects_missing_exact_receipt(tmp_path, runner):
+    path = save_synthetic_snapshot(tmp_path, "baseline")
+    payload = json.loads(path.read_text())
+    del payload["accounting_components_file"]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="requires an exact per-household"):
+        runner["load_snapshot"](path)
+
+
+def test_gain_vector_cannot_differ_even_when_its_weighted_total_matches(
+    tmp_path, runner
+):
+    base = save_synthetic_snapshot(tmp_path, "baseline")
+    ref = save_synthetic_snapshot(tmp_path, "reform")
+    payload = json.loads(ref.read_text())
+    path = tmp_path / payload["household_vector_file"]
+    vector = pickle.loads(path.read_bytes())
+    vector.iloc[0] += np.float32(7)
+    vector.iloc[1] -= np.float32(2)
+    data = pickle.dumps(vector)
+    path.write_bytes(data)
+    payload["household_vector_sha256"] = hashlib.sha256(data).hexdigest()
+    ref.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="Gain vector differs"):
         runner["comparison"](base, ref, "expansion_2027", tmp_path / "result.json")
