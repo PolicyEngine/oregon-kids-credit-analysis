@@ -6,6 +6,7 @@ interpreter. The host heavy-run wrapper must own every population command.
 """
 
 import argparse
+import gc
 import hashlib
 import importlib.metadata as metadata
 import json
@@ -305,33 +306,37 @@ def preflight(pe, identity, output):
 
 
 def snapshot(pe, identity, year, region, output, scenario_name=None):
-    kwargs = {}
     scenario = SCENARIOS[scenario_name] if scenario_name else None
     if scenario:
-        from policyengine_core.reforms import Reform
-        from policyengine_us import CountryTaxBenefitSystem
-
         if year != scenario.year or region != "OR":
             raise ValueError("Policy snapshot must use its scenario's Oregon/year")
-        # Supply an already reformed system through the supported constructor
-        # surface. Passing reform= also retains a second baseline population.
-        kwargs["tax_benefit_system"] = CountryTaxBenefitSystem(
-            reform=(Reform.from_dict(scenario.reform(), country_id="us"),)
-        )
     progress("construct_start", scenario=scenario_name, year=year, region=region)
     simulation = pe.us.managed_microsimulation(
-        dataset="populace_us_2024", dataset_end_year=2029, **kwargs
+        dataset="populace_us_2024", dataset_end_year=2029
     )
+    if scenario:
+        apply_scenario(simulation, scenario)
     if simulation.baseline is not None:
         raise ValueError("A snapshot must retain only its own population branch")
     progress("construct_complete", scenario=scenario_name, year=year, region=region)
     source_inputs = input_audit(simulation)
     fingerprints = covariate_fingerprints(simulation, year)
     values, mask, accounting_vectors = totals(simulation, year, region)
+    parameters = parameter_values(simulation.tax_benefit_system)
+    bundle = simulation.policyengine_bundle
+    health = bool(
+        simulation.tax_benefit_system.parameters(
+            f"{year}-01-01"
+        ).gov.simulation.include_health_benefits_in_net_income
+    )
+    records = len(mask[mask])
+    vector = accounting_vectors["household_net_income"]
+    # All model calculations and metadata extraction are finished. The saved
+    # native vectors own the values/indexes/weights needed by the receipt.
+    del simulation, mask
+    gc.collect()
+    progress("simulation_released", scenario=scenario_name, year=year, region=region)
     check, absolute_masses = native_accounting_check(accounting_vectors)
-    vector = simulation.calc("household_net_income", period=year, map_to="household")[
-        mask
-    ]
     vector_path = Path(output).with_suffix(".households.pkl")
     vector_path.parent.mkdir(parents=True, exist_ok=True)
     # Native MicroSeries serialization preserves its weights and row index.
@@ -351,20 +356,23 @@ def snapshot(pe, identity, year, region, output, scenario_name=None):
             "scenario": scenario_name,
             "reform": scenario.reform() if scenario else {},
             "totals": values,
-            "household_records": len(mask[mask]),
+            "household_records": records,
             "covariate_fingerprints": fingerprints,
             "source_input_audit": source_inputs,
             "household_vector_file": vector_path.name,
             "household_vector_sha256": sha256(vector_path),
             "accounting_components_file": components_path.name,
             "accounting_components_sha256": sha256(components_path),
-            "health_in_household_benefits": bool(
-                simulation.tax_benefit_system.parameters(
-                    f"{year}-01-01"
-                ).gov.simulation.include_health_benefits_in_net_income
-            ),
-            "parameters": parameter_values(simulation.tax_benefit_system),
-            "bundle": simulation.policyengine_bundle,
+            "health_in_household_benefits": health,
+            "parameters": parameters,
+            "bundle": bundle,
+            "simulation_configuration": {
+                "initialization": "managed_current_law_then_apply_reform"
+                if scenario
+                else "managed_current_law",
+                "post_calculation_lifecycle": "release_before_receipt_validation",
+                "dataset_end_year": 2029,
+            },
             "accounting_residual": check["residual"],
             "accounting_check": check,
             "accounting_absolute_masses": absolute_masses,
@@ -378,6 +386,13 @@ def snapshot(pe, identity, year, region, output, scenario_name=None):
             f"Household accounting fails: {check}; actual checkpoint saved for audit"
         )
     progress("snapshot_complete", scenario=scenario_name, year=year, region=region)
+
+
+def apply_scenario(simulation, scenario):
+    """Use the engine's isolated parameter-write and cache invalidation path."""
+    from policyengine_core.reforms import Reform
+
+    simulation.apply_reform(Reform.from_dict(scenario.reform(), country_id="us"))
 
 
 def split_preflight(identity, output):
