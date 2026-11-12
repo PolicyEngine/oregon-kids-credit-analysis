@@ -1,0 +1,12 @@
+.venv*/
+.runtime/
+data/
+results/
+logs/
+wheels/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+.DS_Store
